@@ -58,7 +58,7 @@ jobs:
             gh pr view "$INPUT_PR" -R "$TARGET_REPO" --json number,headRefOid \
               --jq '"\(.number) \(.headRefOid)"' > selected.txt
           else
-            gh pr list -R "$TARGET_REPO" --state open --json number,headRefOid \
+            gh pr list -R "$TARGET_REPO" --state open --limit 1000 --json number,headRefOid \
               --jq '.[] | "\(.number) \(.headRefOid)"' > selected.txt
           fi
           numbers=$(cut -d' ' -f1 selected.txt | tr '\n' ' ')
@@ -122,7 +122,7 @@ jobs:
           with open(os.environ["GITHUB_OUTPUT"], "a") as out:
               out.write("pending=" + json.dumps(picked) + "\n")
           with open("pending.txt", "w") as fh:
-              fh.write("".join(f"{q['number']} {q['head']}\n" for q in picked))
+              fh.write("".join(f"{q['number']} {q['head']} {q['ctx']}\n" for q in picked))
           PY
 
       - name: Fetch diffs and touched files for the reviewer (deterministic, pinned to the queued head; the reviewer gets no token)
@@ -131,8 +131,10 @@ jobs:
           GH_TOKEN: ${{ steps.app.outputs.token }}
         run: |
           mkdir -p review-input verdicts forced-verdicts
-          cp pending.txt review-input/pending.txt
-          while read -r pr head; do
+          # The reviewer is given the pull request and the head it is reading,
+          # not the digest, which only the verdict marker needs.
+          cut -d' ' -f1,2 pending.txt > review-input/pending.txt
+          while read -r pr head ctx; do
             base=$(gh pr view "$pr" -R "${TARGET_REPO}" --json baseRefOid -q .baseRefOid)
             # the diff and every file are read at the exact queued head, never at the live PR
             gh api "repos/${TARGET_REPO}/compare/$base...$head" -H "Accept: application/vnd.github.diff" > "review-input/$pr.diff"
@@ -199,7 +201,7 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
         run: |
-          while read -r pr head; do
+          while read -r pr head ctx; do
             # A forced verdict (written by the deterministic fetch step, outside the reviewer's
             # writable path) always wins over anything the reviewer wrote.
             f="verdicts/$pr.md"
@@ -209,7 +211,7 @@ jobs:
             if [ -z "$verdict" ]; then echo "malformed verdict for #$pr"; continue; fi
             tail -n +2 "$f" > body.md
             python -m omni_maintainer gate post-verdict --repo "$TARGET_REPO" --pr "$pr" --head "$head" \
-              --verdict "$verdict" --body-file body.md
+              --ctx "$ctx" --verdict "$verdict" --body-file body.md
           done < pending.txt
 
       - name: Evaluate the bar and publish the maintainer-gate check on the target repository

@@ -65,6 +65,9 @@ class PullSnapshot:
     repo: str
     number: int
     title: str
+    # The reviewer is shown these two and told to judge them, and both are
+    # editable without moving the head, so the verdict is bound to their digest.
+    body: str
     head_sha: str
     head_ref: str
     base_ref: str
@@ -181,6 +184,7 @@ def build_snapshot(repo: str, *, pull: dict[str, Any], files: list[dict[str, Any
         repo=repo,
         number=int(pull["number"]),
         title=str(pull.get("title") or ""),
+        body=str(pull.get("body") or ""),
         head_sha=str(head.get("sha") or "").lower(),
         head_ref=str(head.get("ref") or ""),
         base_ref=str(base.get("ref") or ""),

@@ -22,7 +22,8 @@ from .gate import merge as gate_merge
 from .gate.actors import human_pause_active
 from .gate.bar import BarInputs, evaluate
 from .gate.reads import IncompleteRead, PullSnapshot, load_snapshot
-from .gate.verdict import APPROVE, REVISE, format_marker, needs_verdict
+from .gate.verdict import (APPROVE, REVISE, context_digest, format_marker,
+                           needs_verdict)
 from .monitor import canary as canary_mod
 from .monitor import rollback as rollback_mod
 from .gate.reads import parse_time
@@ -256,8 +257,12 @@ def cmd_gate_review_queue(args: argparse.Namespace, policy: dict[str, Any], gh: 
                          str(r.get('state') or ''), parse_time(r.get('submitted_at')), str(r.get('body') or ''),
                          str(r.get('commit_id') or '').lower()) for r in reviews or []]
         head = str((pull.get("head") or {}).get("sha") or "").lower()
-        if needs_verdict(parsed, head_sha=head, reviewer_login=reviewer):
-            queue.append({"number": number, "head": head, "title": pull.get("title"),
+        # The digest of what the reviewer is shown besides the diff. An edited
+        # title or description does not move the head, so without this a
+        # rewritten justification would keep the approval it never got.
+        ctx = context_digest(str(pull.get("title") or ""), str(pull.get("body") or ""))
+        if needs_verdict(parsed, head_sha=head, ctx=ctx, reviewer_login=reviewer):
+            queue.append({"number": number, "head": head, "ctx": ctx, "title": pull.get("title"),
                           "author": (pull.get("user") or {}).get("login"), "url": pull.get("html_url")})
     _emit({"repo": args.repo, "queue": queue})
     return EXIT_OK
@@ -271,11 +276,22 @@ def cmd_gate_post_verdict(args: argparse.Namespace, policy: dict[str, Any], gh: 
         _emit({"ok": False, "error": str(exc)})
         return EXIT_FAIL
     verdict = APPROVE if args.verdict.upper() == "APPROVE" else REVISE
-    full = format_marker(args.head, verdict) + "\n\n" + body.strip() + "\n"
+    ctx = args.ctx
+    if not ctx:
+        # The workflow passes the digest the queue computed, so the verdict is
+        # bound to the text the reviewer actually read. Recomputing it here
+        # would bind it to whatever the description says now instead.
+        _emit({"ok": False, "error": "--ctx is required: the verdict binds to the reviewed text"})
+        return EXIT_USAGE
+    try:
+        full = format_marker(args.head, verdict, ctx) + "\n\n" + body.strip() + "\n"
+    except ValueError as exc:
+        _emit({"ok": False, "error": str(exc)})
+        return EXIT_USAGE
     payload = {"commit_id": args.head, "event": "COMMENT", "body": full}
     gh.write(["api", f"repos/{args.repo}/pulls/{args.pr}/reviews", "-X", "POST", "--input", "-"],
              stdin=json.dumps(payload))
-    _emit({"ok": True, "verdict": verdict, "head": args.head})
+    _emit({"ok": True, "verdict": verdict, "head": args.head, "ctx": ctx})
     return EXIT_OK
 
 
@@ -1032,6 +1048,7 @@ def build_parser() -> argparse.ArgumentParser:
     rq.add_argument("--repo", required=True)
     rq.set_defaults(func=cmd_gate_review_queue)
     pv = gate.add_parser("post-verdict", help="post the reviewer's COMMENT review with the marker")
+    pv.add_argument("--ctx", default="", help="context digest from the review queue for this head")
     pv.add_argument("--repo", required=True)
     pv.add_argument("--pr", type=int, required=True)
     pv.add_argument("--head", required=True)

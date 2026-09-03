@@ -202,3 +202,35 @@ def test_the_template_carries_a_pin_placeholder_and_the_own_gate_does_not() -> N
     assert "<PIN-SHA>" not in own
     assert "pip install --quiet ./evaluator" in own
     assert "ref: main" in own
+
+
+def test_a_sweep_lists_every_open_pull_request(gate) -> None:
+    """gh pr list stops at 30 by default, and the ones past it would keep
+    whatever check they already carried."""
+    text, workflow, which = gate
+    select = steps(workflow)[index_of(steps(workflow), "Select pull requests")]["run"]
+    for listing in re.findall(r"gh pr list[^\n]*", select):
+        assert "--limit" in listing, listing
+        limit = int(re.search(r"--limit (\d+)", listing).group(1))
+        assert limit >= 1000, listing
+
+
+def test_the_verdict_binds_to_the_text_the_reviewer_was_shown(gate) -> None:
+    """The reviewer reads the title and description and is told to judge them.
+    Both are editable by anyone who can edit the pull request, without moving
+    the head, so a verdict keyed to the head alone would go on standing after
+    the justification it read was rewritten."""
+    text, workflow, which = gate
+    step_list = steps(workflow)
+    post = step_list[index_of(step_list, "Post verdicts")]["run"]
+    assert '--ctx "$ctx"' in post, "the marker must carry the digest of the reviewed text"
+    assert "while read -r pr head ctx" in post, "the digest travels with the queue entry"
+    fetch = step_list[index_of(step_list, "Fetch diffs")]["run"]
+    assert "while read -r pr head ctx" in fetch
+    assert "cut -d' ' -f1,2 pending.txt" in fetch, \
+        "the reviewer is given the pull request and head, not the digest"
+    if which != "rb":
+        on = workflow[True] if True in workflow else workflow["on"]
+        assert "edited" in on["pull_request_target"]["types"], \
+            "an edited title or description must re-run the gate"
+

@@ -8,7 +8,7 @@ import pytest
 from omni_maintainer.config import repo_config
 from omni_maintainer.gate.bar import BarInputs, carve_out_hits, evaluate, path_matches
 from omni_maintainer.gate.reads import CheckRun, FileChange, Review
-from omni_maintainer.gate.verdict import format_marker
+from omni_maintainer.gate.verdict import context_digest, format_marker
 
 IMC = "JiusiServe/InferMatrixCopilot"
 REVIEWER = "omni-maintainer-gate[bot]"
@@ -21,7 +21,8 @@ def _inputs(now, **kw):
 
 
 def _approved(snapshot, at):
-    marker = format_marker(snapshot.head_sha, "APPROVE")
+    marker = format_marker(snapshot.head_sha, "APPROVE",
+                           context_digest(snapshot.title, snapshot.body))
     return replace(snapshot, reviews=snapshot.reviews + (
         Review(REVIEWER, "Bot", "COMMENTED", at, marker + "\n\nlooks fine", snapshot.head_sha),))
 
@@ -147,11 +148,11 @@ def test_revise_verdict_and_forged_marker(pr84, policy, now):
     snap = _seen(_clean(pr84), seen)
     at = now
     forged = replace(snap, reviews=(Review("someone-else", "User", "COMMENTED", now,
-                                           format_marker(snap.head_sha, "APPROVE"), snap.head_sha),))
+                                           format_marker(snap.head_sha, "APPROVE", context_digest(snap.title, snap.body)), snap.head_sha),))
     result = evaluate(forged, policy=policy, repo=repo_config(policy, IMC), inputs=_inputs(at))
     assert any("no reviewer verdict" in f for f in result.failures)
     revised = replace(snap, reviews=(Review(REVIEWER, "Bot", "COMMENTED", now,
-                                            format_marker(snap.head_sha, "REVISE"), snap.head_sha),))
+                                            format_marker(snap.head_sha, "REVISE", context_digest(snap.title, snap.body)), snap.head_sha),))
     result = evaluate(revised, policy=policy, repo=repo_config(policy, IMC), inputs=_inputs(at))
     assert any("REVISE" in f for f in result.failures)
 
