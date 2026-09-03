@@ -7,7 +7,8 @@ import pytest
 from omni_maintainer.gate.actors import human_label_active, human_pause_active
 from omni_maintainer.gate.caps import merges_today, prs_opened_today
 from omni_maintainer.gate.reads import IncompleteRead, build_snapshot, load_snapshot
-from omni_maintainer.gate.verdict import format_marker, latest_verdict, parse_marker
+from omni_maintainer.gate.verdict import (context_digest, format_marker,
+                                          latest_verdict, parse_marker)
 from omni_maintainer.gate.reads import Review
 from conftest import load
 
@@ -50,17 +51,28 @@ def test_go_label_latest_event_wins():
 
 def test_marker_roundtrip_and_reviewer_identity():
     head = "a" * 40
-    marker = format_marker(head, "APPROVE")
-    assert parse_marker("intro\n" + marker + "\nbody") == (head, "APPROVE")
+    ctx = context_digest("Fix the thing", "because it was broken")
+    marker = format_marker(head, "APPROVE", ctx)
+    assert parse_marker("intro\n" + marker + "\nbody") == (head, ctx, "APPROVE")
     now = datetime(2026, 9, 1, tzinfo=timezone.utc)
     reviews = [Review("omni-maintainer-gate[bot]", "Bot", "COMMENTED", now, marker, head),
                Review("omni-maintainer-gate[bot]", "Bot", "COMMENTED", now + timedelta(minutes=1),
-                      format_marker(head, "REVISE"), head),
+                      format_marker(head, "REVISE", ctx), head),
                Review("impostor", "User", "COMMENTED", now + timedelta(minutes=2), marker, head)]
-    assert latest_verdict(reviews, head_sha=head, reviewer_login="omni-maintainer-gate[bot]") == "REVISE"
-    assert latest_verdict(reviews[:1], head_sha="b" * 40, reviewer_login="omni-maintainer-gate[bot]") is None
+    assert latest_verdict(reviews, head_sha=head, ctx=ctx, reviewer_login="omni-maintainer-gate[bot]") == "REVISE"
+    assert latest_verdict(reviews[:1], head_sha="b" * 40, ctx=ctx, reviewer_login="omni-maintainer-gate[bot]") is None
+    # A different description is a different review, whatever the head says.
+    other = context_digest("Fix the thing", "because it was broken, actually")
+    assert latest_verdict(reviews, head_sha=head, ctx=other,
+                          reviewer_login="omni-maintainer-gate[bot]") is None
+    # A v1 marker carried no digest and is not a verdict any more.
+    v1 = f"<!-- omni-maintainer:review:v1 head={head} verdict=APPROVE -->"
+    assert parse_marker(v1) is None
+    assert latest_verdict([Review("omni-maintainer-gate[bot]", "Bot", "COMMENTED", now, v1, head)],
+                          head_sha=head, ctx=ctx,
+                          reviewer_login="omni-maintainer-gate[bot]") is None
     with pytest.raises(ValueError):
-        format_marker("short", "APPROVE")
+        format_marker("short", "APPROVE", ctx)
 
 
 def test_build_snapshot_refuses_incomplete_collections(policy):

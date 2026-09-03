@@ -19,7 +19,7 @@ from typing import Any, Callable
 from ..config import RepoConfig, carve_out_exempt, carve_out_globs
 from .actors import human_label_active
 from .reads import PullSnapshot, Review
-from .verdict import APPROVE, REVISE, latest_verdict
+from .verdict import APPROVE, REVISE, context_digest, latest_verdict
 
 
 @dataclass(frozen=True)
@@ -266,9 +266,13 @@ def evaluate(snapshot: PullSnapshot, *, policy: dict[str, Any], repo: RepoConfig
 
     # 3. reviewer verdict on the exact head
     if not fast_path:
-        verdict = latest_verdict(snapshot.reviews, head_sha=snapshot.head_sha, reviewer_login=reviewer)
+        ctx = context_digest(snapshot.title, snapshot.body)
+        verdict = latest_verdict(snapshot.reviews, head_sha=snapshot.head_sha, ctx=ctx,
+                                 reviewer_login=reviewer)
         if verdict is None:
-            result.failures.append(f"no reviewer verdict for head {snapshot.head_sha[:8]}")
+            result.failures.append(
+                f"no reviewer verdict for head {snapshot.head_sha[:8]} and the current "
+                "title and description (an edited description needs a fresh review)")
         elif verdict == REVISE:
             result.failures.append("reviewer verdict is REVISE for this head")
         elif verdict == APPROVE:

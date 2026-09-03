@@ -17,6 +17,7 @@ class FakeGh:
 
     def __init__(self):
         self.writes: list[list[str]] = []
+        self.write_bodies: list[str] = []
         self.pull = load("pr84_pull.json")
 
     def api(self, path, *, method="GET", fields=None, paginate=False, raw_fields=None):
@@ -53,6 +54,7 @@ class FakeGh:
 
     def write(self, args, stdin=None):
         self.writes.append(list(args))
+        self.write_bodies.append(stdin or "")
         return GhResult(True, "", "", dry_run=True)
 
 
@@ -438,10 +440,26 @@ def test_issue_upsert_is_a_dry_run_until_issues_live(fake, tmp_path, capsys, mon
 def test_post_verdict_refuses_credentials(fake, tmp_path, capsys):
     body = tmp_path / "b.md"
     body.write_text("looks fine, token ghp_" + "A" * 24)
+    ctx = "abcdef012345"
     rc = cli.main(["gate", "post-verdict", "--repo", "JiusiServe/InferMatrixCopilot", "--pr", "84",
-                   "--head", "a" * 40, "--verdict", "APPROVE", "--body-file", str(body)])
+                   "--head", "a" * 40, "--ctx", ctx, "--verdict", "APPROVE", "--body-file", str(body)])
     assert rc == cli.EXIT_FAIL and not fake.writes
     body.write_text("looks fine")
     rc = cli.main(["gate", "post-verdict", "--repo", "JiusiServe/InferMatrixCopilot", "--pr", "84",
-                   "--head", "a" * 40, "--verdict", "approve", "--body-file", str(body)])
+                   "--head", "a" * 40, "--ctx", ctx, "--verdict", "approve", "--body-file", str(body)])
     assert rc == cli.EXIT_OK and fake.writes[-1][:2] == ["api", "repos/JiusiServe/InferMatrixCopilot/pulls/84/reviews"]
+    assert f"ctx={ctx}" in fake.write_bodies[-1], "the marker must carry the reviewed context"
+
+
+def test_post_verdict_refuses_without_the_reviewed_context(fake, tmp_path, capsys):
+    """The digest comes from the queue, so it names the text the reviewer read.
+    Recomputing it at post time would bind the verdict to whatever the
+    description says by then, which is the hole this closes."""
+    body = tmp_path / "b.md"
+    body.write_text("looks fine")
+    rc = cli.main(["gate", "post-verdict", "--repo", "JiusiServe/InferMatrixCopilot", "--pr", "84",
+                   "--head", "a" * 40, "--verdict", "APPROVE", "--body-file", str(body)])
+    assert rc == cli.EXIT_USAGE and not fake.writes
+    rc = cli.main(["gate", "post-verdict", "--repo", "JiusiServe/InferMatrixCopilot", "--pr", "84",
+                   "--head", "a" * 40, "--ctx", "nothex", "--verdict", "APPROVE", "--body-file", str(body)])
+    assert rc == cli.EXIT_USAGE and not fake.writes
