@@ -107,7 +107,7 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
         run: |
-          mkdir -p review-input verdicts
+          mkdir -p review-input verdicts forced-verdicts
           cp pending.txt review-input/pending.txt
           while read -r pr head; do
             base=$(gh pr view "$pr" -R "${GITHUB_REPOSITORY}" --json baseRefOid -q .baseRefOid)
@@ -120,7 +120,7 @@ jobs:
             gh api "repos/${GITHUB_REPOSITORY}/compare/$base...$head" --jq '.files[].filename' > "review-input/$pr.files"
             got=$(grep -c . "review-input/$pr.files" || true)
             if [ "$got" -ge 300 ]; then
-              printf 'VERDICT: REVISE\n\nThe queued head changes %s or more files and the compare API lists at most 300, so the review inputs may be incomplete. Split the change or request a human review; automated review fails closed here.\n' "$got" > "verdicts/$pr.md"
+              printf 'VERDICT: REVISE\n\nThe queued head changes %s or more files and the compare API lists at most 300, so the review inputs may be incomplete. Split the change or request a human review; automated review fails closed here.\n' "$got" > "forced-verdicts/$pr.md"
               sed -i "/^$pr /d" review-input/pending.txt
               continue
             fi
@@ -161,7 +161,10 @@ jobs:
           GH_TOKEN: ${{ steps.app.outputs.token }}
         run: |
           while read -r pr head; do
+            # A forced verdict (written by the deterministic fetch step, outside the reviewer's
+            # writable path) always wins over anything the reviewer wrote.
             f="verdicts/$pr.md"
+            if [ -s "forced-verdicts/$pr.md" ]; then f="forced-verdicts/$pr.md"; fi
             if [ ! -s "$f" ]; then echo "no verdict file for #$pr"; continue; fi
             verdict=$(head -n1 "$f" | sed -n 's/^VERDICT: *\(APPROVE\|REVISE\).*/\1/p')
             if [ -z "$verdict" ]; then echo "malformed verdict for #$pr"; continue; fi
