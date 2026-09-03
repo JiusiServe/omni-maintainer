@@ -211,10 +211,23 @@ def check_holds(exempt_issue_number: int | None) -> None:
     if rollback_exception():
         return
     blocking = []
+    seen = set()
+    # Canary records are recognised by authorship and marker, never by label:
+    # removing a label from a workflow-authored record does not lift its hold.
+    for issue in api(f"repos/{REPO}/issues?creator={WORKFLOW_LOGIN}&state=open&per_page=100", paginate=True):
+        if "pull_request" in issue or "omni-maintainer:canary:v1" not in (issue.get("body") or ""):
+            continue
+        if exempt_issue_number is not None and int(issue["number"]) == exempt_issue_number:
+            continue  # this attempt's own record; every earlier attempt still holds
+        seen.add(int(issue["number"]))
+        blocking.append(f"#{issue['number']} (open canary record) {issue.get('title')}")
     for label in HOLD_LABELS:
         for issue in issues(label):
+            if int(issue["number"]) in seen:
+                continue
             if exempt_issue_number is not None and label == CANARY_LABEL and int(issue["number"]) == exempt_issue_number:
-                continue  # this attempt's own record; every earlier attempt still holds
+                continue
+            seen.add(int(issue["number"]))
             blocking.append(f"#{issue['number']} ({label}) {issue.get('title')}")
     for issue in issues("maintainer:incident", "closed"):
         closer = ""
