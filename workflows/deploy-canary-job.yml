@@ -15,17 +15,19 @@
 # What the script checks, live, from immutable facts only (Actions run and
 # job metadata, commit trees, the branch tip, issue events; issue bodies are
 # written, never trusted):
-#   record mode (canary-record): main still at github.sha; no open canary,
-#     incident or rollback and no incident closed by a non-human within
-#     30 days, unless the push is a verified rollback (GitHub associates it
-#     with a merged maintainer:rollback PR AND its tree equals what the
-#     currently live deployment, by deploy-production job success, replaced);
-#     both dashboards readable (three attempts, else the deploy is blocked);
-#     one record per (run_id, run_attempt), authored by github-actions[bot].
-#   guard mode (deploy-production, seconds before the deploy script): the
-#     same tip and holds checks re-read live (this run's own record exempt),
-#     PRODUCTION_DEPLOY_ENABLED still true, a record for exactly this
-#     attempt exists, and the pre-deploy counters are posted as a
+#   record mode (canary-record): main still at github.sha; the ledger is not
+#     paused; the push actor is an allowlisted human and a merge commit is
+#     GitHub's confirmed human merge into main; the cooldown since the last
+#     successful deployment has elapsed; no open canary, incident or rollback
+#     and no incident closed by a non-human within 30 days, unless the push is
+#     a verified rollback (GitHub associates it with a merged
+#     maintainer:rollback PR AND its tree equals what the currently live
+#     deployment, by deploy-production job success, replaced); both dashboards
+#     readable (three attempts, else the deploy is blocked); one record per
+#     (run_id, run_attempt), authored by github-actions[bot].
+#   guard mode (deploy-production, seconds before the deploy script): every
+#     one of those re-read live (this attempt's own record exempt), plus a
+#     record for exactly this attempt, and the pre-deploy counters posted as a
 #     workflow-authored comment the monitor trusts.
 #
 # Atomicity: canary-record runs under its own concurrency group with
@@ -61,6 +63,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GITHUB_EVENT_BEFORE: ${{ github.event.before }}
           GITHUB_HEAD_MESSAGE: ${{ github.event.head_commit.message }}
+          LEDGER_REPO: JiusiServe/omni-reviewbot
+          LEDGER_ISSUE: "32"
+          DEPLOY_COOLDOWN_HOURS: "4"
           HUMANS: "tzhouam"   # the policy's allowlisted humans, space separated
         run: python3 deploy/canary_guard.py record
 
@@ -80,5 +85,18 @@ jobs:
   #         GH_TOKEN: ${{ github.token }}
   #         GITHUB_EVENT_BEFORE: ${{ github.event.before }}
   #         GITHUB_HEAD_MESSAGE: ${{ github.event.head_commit.message }}
+  #         LEDGER_REPO: JiusiServe/omni-reviewbot
+  #         LEDGER_ISSUE: "32"
+  #         DEPLOY_COOLDOWN_HOURS: "4"
   #         HUMANS: "tzhouam"
   #       run: python3 deploy/canary_guard.py guard
+  #
+  # Two kill switches with different reach:
+  #   - `maintainer:paused` on the ledger issue is LIVE: the guard reads it
+  #     seconds before the deploy, so it stops a run already under way. Only a
+  #     human's label event counts, in either direction.
+  #   - `vars.PRODUCTION_DEPLOY_ENABLED=false` is read when a run is QUEUED,
+  #     so it stops the next run, not the current one.
+  # DEPLOY_COOLDOWN_HOURS is the immutable minimum between successful
+  # deployments (a verified rollback is exempt); lower it deliberately, in a
+  # reviewed change, never to unblock a single deploy.
