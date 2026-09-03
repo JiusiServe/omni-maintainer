@@ -243,14 +243,25 @@ def test_human_only_repo_and_never_merge_branches(pr84, policy, now):
     result = evaluate(intake, policy=policy, repo=repo_config(policy, IMC), inputs=_inputs(now))
     assert any("never merged" in f for f in result.failures)
     # knowledge and adapter manifests are hard exclusions: a human go does not help
-    manifest = replace(_seen(_approved(_clean(pr84), seen), seen),
+    base_seen = _seen(_approved(_clean(pr84), seen), seen)
+    manifest = replace(base_seen,
                        files=(FileChange("adapters/vllm_omni/manifest.yaml", "modified", 1, 1, "+x"),),
+                       check_runs=base_seen.check_runs + (
+                           CheckRun("audit", "completed", "success", "github-actions", base_seen.head_sha),),
                        labels=("maintainer-go",), timeline=(
                            {"event": "labeled", "label": {"name": "maintainer-go"},
                             "actor": {"login": "tzhouam", "type": "User"},
                             "created_at": (seen + timedelta(minutes=1)).isoformat()},))
-    result = evaluate(manifest, policy=policy, repo=repo_config(policy, IMC), inputs=_inputs(now))
+    # the arbiter refuses even with a human go...
+    result = evaluate(manifest, policy=policy, repo=repo_config(policy, IMC), inputs=_inputs(now), enforce_caps=True)
     assert any("human promotion only" in f for f in result.failures)
+    # ...while the published check passes so the human can merge through the ruleset
+    published = evaluate(manifest, policy=policy, repo=repo_config(policy, IMC), inputs=_inputs(now), enforce_caps=False)
+    assert published.ok and any("automation excluded" in n for n in published.notes)
+    # and without a verified human go the published check fails too
+    no_go = replace(manifest, labels=(), timeline=())
+    assert any("only a human may merge" in f
+               for f in evaluate(no_go, policy=policy, repo=repo_config(policy, IMC), inputs=_inputs(now), enforce_caps=False).failures)
 
 
 def test_size_limits(pr84, policy, now):

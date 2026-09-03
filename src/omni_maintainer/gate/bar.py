@@ -230,9 +230,6 @@ def evaluate(snapshot: PullSnapshot, *, policy: dict[str, Any], repo: RepoConfig
     excluded = sorted({path for path in snapshot.paths()
                        for pattern in (policy["carve_outs"].get("never_merge_paths") or ())
                        if path_matches(path, pattern)})
-    if excluded:
-        result.failures.append("paths that automation never merges (human promotion only): "
-                               + ", ".join(excluded[:6]) + (" …" if len(excluded) > 6 else ""))
 
     # 2. required CI on the head, bound to the integration that must produce it
     ci_app = str(policy["identities"].get("ci_app_slug") or "github-actions")
@@ -291,7 +288,21 @@ def evaluate(snapshot: PullSnapshot, *, policy: dict[str, Any], repo: RepoConfig
             result.failures.append(
                 f"veto window: {hours:.1f} h remaining since the gate first saw this head")
 
-    # 6. carve-outs
+    # 6a. hard exclusions. The arbiter (enforce_caps=True) never merges them.
+    # The published check, which a ruleset requires for HUMAN merges too,
+    # passes them only under verified human authorization, otherwise the
+    # exclusion would lock humans out of the knowledge plane as well.
+    if excluded:
+        listed = ", ".join(excluded[:6]) + (" …" if len(excluded) > 6 else "")
+        if enforce_caps:
+            result.failures.append(f"paths that automation never merges (human promotion only): {listed}")
+        elif has_go:
+            result.notes.append(f"automation excluded (human promotion only), human go verified: {listed}")
+        else:
+            result.failures.append(
+                f"paths that only a human may merge need label {label_names['go']} from a human: {listed}")
+
+    # 6b. carve-outs
     hits = carve_out_hits(snapshot, policy)
     result.carve_out_paths = hits
     if repo.human_only:

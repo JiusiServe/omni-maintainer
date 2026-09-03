@@ -71,6 +71,21 @@ def test_gate_evaluate_reports_every_failed_rule(fake, capsys):
     assert publish and "-X" in publish[0]
 
 
+def test_publish_failure_crashes_the_job_instead_of_looking_like_a_failed_bar(fake, capsys):
+    from omni_maintainer.routine.ghcli import GhError
+
+    def failing_write(args, stdin=None):
+        if args[:2] == ["api", "repos/JiusiServe/InferMatrixCopilot/check-runs"]:
+            raise GhError("boom")
+        return GhResult(True, "", "", dry_run=True)
+
+    fake.write = failing_write
+    rc = cli.main(["gate", "evaluate", "--repo", "JiusiServe/InferMatrixCopilot", "--pr", "84", "--publish"])
+    out = json.loads(capsys.readouterr().out)
+    assert rc == cli.EXIT_CRASH and "publish_error" in out
+    assert cli.EXIT_CRASH >= 2 and cli.EXIT_FAIL == 1
+
+
 def test_preflight_reports_counters(fake, capsys):
     rc = cli.main(["preflight"])
     out = json.loads(capsys.readouterr().out)
@@ -170,7 +185,7 @@ class FailingGh(RollbackGh):
 def test_rollback_transition_failure_leaves_old_state_in_place(monkeypatch, tmp_path, capsys):
     gh = FailingGh(lambda a: "--add-label" in a and "rollback:merged" in a)
     rc = _tick_with(monkeypatch, tmp_path, gh)
-    assert rc == cli.EXIT_FAIL
+    assert rc == cli.EXIT_CRASH
     # nothing was removed, so the next tick sees rollback:pr-open again and retries
     assert not any("--remove-label" in w for w in gh.writes)
 
@@ -236,7 +251,7 @@ def test_recovery_persists_the_label_before_closing_the_incident(monkeypatch, tm
     assert close_canary_at < label_at < close_incident_at, order
     # if the label write fails, the incident is NOT closed and the next tick retries from verifying
     failing = VerifyingGh(fail_on=lambda a: "--add-label" in a and "rollback:recovered" in a)
-    assert _tick_with(monkeypatch, tmp_path, failing) == cli.EXIT_FAIL
+    assert _tick_with(monkeypatch, tmp_path, failing) == cli.EXIT_CRASH
     assert not any(w[:3] == ["issue", "close", "50"] for w in failing.writes)
 
 
@@ -248,7 +263,7 @@ def test_terminal_state_is_reconciled_on_later_ticks(monkeypatch, tmp_path, caps
     assert {w[2] for w in closes} == {"40", "50"}, "original canary and incident are closed even though the label already says recovered"
     # and a failing close is retried next tick because nothing else changes
     gh2 = RecoveredGh(fail_close=True)
-    assert _tick_with(monkeypatch, tmp_path, gh2) == cli.EXIT_FAIL
+    assert _tick_with(monkeypatch, tmp_path, gh2) == cli.EXIT_CRASH
 
 
 def test_failed_rollback_files_one_blocked_issue(monkeypatch, tmp_path, capsys):
@@ -274,6 +289,57 @@ def test_failed_rollback_files_one_blocked_issue(monkeypatch, tmp_path, capsys):
     gh.writes.clear()
     assert _tick_with(monkeypatch, tmp_path, gh) == cli.EXIT_OK
     assert not any(w[:2] == ["issue", "create"] for w in gh.writes)
+
+
+class PushGh(FakeGh):
+    """RB main gained one direct push; a canary record claims a human pushed it."""
+
+    OLD = "1" * 40
+    NEW = "2" * 40
+
+    def __init__(self, run_actor: str, record_pusher: str = "tzhouam", run_event: str = "push"):
+        super().__init__()
+        from omni_maintainer.monitor.canary import CanaryRecord
+        self.run_actor, self.run_event = run_actor, run_event
+        self.record = CanaryRecord(repo="JiusiServe/omni-reviewbot", merge_sha=self.NEW, pre_merge_sha=self.OLD,
+                                   pr_number=None, deploy_run_id=901, opened_at="2026-09-03T00:00:00+00:00",
+                                   pusher=record_pusher)
+
+    def api(self, path, *, method="GET", fields=None, paginate=False, raw_fields=None):
+        if path.startswith("repos/JiusiServe/omni-reviewbot/commits?sha=main"):
+            return [{"sha": self.NEW, "parents": [{"sha": self.OLD}], "commit": {"message": "hotfix by hand"}},
+                    {"sha": self.OLD, "parents": [{"sha": "0" * 40}], "commit": {"message": "Merge pull request #1 from x/y"}}]
+        if "issues?labels=maintainer:canary&state=all" in path:
+            return [{"number": 70, "body": self.record.to_marker(), "labels": [{"name": "maintainer:canary"}]}]
+        if path.endswith("/actions/runs/901"):
+            return {"event": self.run_event, "head_sha": self.NEW, "actor": {"login": self.run_actor}}
+        if "issues?labels=maintainer:canary&state=open" in path or "issues?labels=maintainer:incident" in path:
+            return []
+        return super().api(path, method=method, fields=fields, paginate=paginate, raw_fields=raw_fields)
+
+
+def _push_tick(monkeypatch, tmp_path, gh):
+    state = tmp_path / "s.json"
+    state.write_text(json.dumps({"cursors": {"rb_main_sha": PushGh.OLD}}))
+    monkeypatch.setattr(cli, "Gh", lambda: gh)
+    monkeypatch.setattr(cli, "_fetch_digests", lambda policy, now: {})
+    monkeypatch.setenv("MAINT_DRY_RUN", "1")
+    return cli.main(["monitor", "tick", "--state-file", str(state)])
+
+
+def test_direct_push_attribution_uses_run_metadata_not_the_record(monkeypatch, tmp_path, capsys):
+    # the record says tzhouam pushed, but the immutable run says someone else did: incident
+    assert _push_tick(monkeypatch, tmp_path, PushGh(run_actor="someone")) == cli.EXIT_OK
+    [push] = json.loads(capsys.readouterr().out)["pushes"]
+    assert push["kind"] == "direct_push_unattributed" and push["incident"]
+    # record and run agree on an allowlisted human: noted, not an incident
+    assert _push_tick(monkeypatch, tmp_path, PushGh(run_actor="tzhouam")) == cli.EXIT_OK
+    [push] = json.loads(capsys.readouterr().out)["pushes"]
+    assert push["kind"] == "direct_push_human" and not push["incident"] and push["pusher"] == "tzhouam"
+    # a run that is not a push event proves nothing
+    assert _push_tick(monkeypatch, tmp_path, PushGh(run_actor="tzhouam", run_event="workflow_dispatch")) == cli.EXIT_OK
+    [push] = json.loads(capsys.readouterr().out)["pushes"]
+    assert push["incident"]
 
 
 def test_issue_upsert_is_a_dry_run_until_issues_live(fake, tmp_path, capsys, monkeypatch):

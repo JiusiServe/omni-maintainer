@@ -21,8 +21,12 @@ pull requests, issues and labels, and nothing else that matters.
 
 Tier B exists because rulesets are unavailable on a private repository in a
 Free-plan organization, so nothing GitHub-side can stop a direct push there.
-The monitor classifies every new commit on its `main` and treats a non-human
-direct push as an incident.
+The same limitation means omni-reviewbot has no protected environment, so its
+gate runs from this repository on a schedule (`maintainer-gate-rb.yml`) with
+the App token. The monitor classifies every new commit on its `main`: a merge
+is only what GitHub's pull-request record confirms, and any other commit is an
+incident unless the deploy run's own record names an allowlisted human as the
+pusher.
 
 ## The bar (what a PR must satisfy)
 
@@ -84,7 +88,8 @@ removing the label changes nothing. Set the repository variable
 ```
 src/omni_maintainer/policy.json          thresholds, caps, carve-outs, labels, identities, phase flags (human-gated)
 prompts/                    self-contained prompts for the probe, monitor and maintain routines
-workflows/                  templates: maintainer-gate.yml (every repo), maintainer-merge.yml (here),
+workflows/                  templates: maintainer-gate.yml (IMC and here), maintainer-gate-rb.yml (the
+                            omni-reviewbot gate, run from here on a schedule), maintainer-merge.yml (here),
                             deploy-canary-job.yml (fragment for omni-reviewbot deploy.yml)
 src/omni_maintainer/gate    reads, actors, verdict, bar, caps, merge
 src/omni_maintainer/monitor dashboard, fingerprint, canary, rollback, pushes, issues

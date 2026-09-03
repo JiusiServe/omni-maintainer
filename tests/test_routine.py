@@ -120,6 +120,61 @@ def test_prepare_revert_refuses_when_main_advanced(tmp_path, monkeypatch):
                        incident_url="i", reason="test", labels=[])
 
 
+def test_gate_revert_facts_are_rederived_from_git_not_issues(tmp_path, monkeypatch):
+    """The gate's revert fast path uses only main's tip, its first parent and the PR head."""
+    from dataclasses import replace
+    from omni_maintainer import cli
+    from omni_maintainer.config import load_policy, repo_config
+    from omni_maintainer.gate.reads import build_snapshot
+    from conftest import load
+
+    for k, v in {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@x", "GIT_COMMITTER_NAME": "t",
+                 "GIT_COMMITTER_EMAIL": "t@x"}.items():
+        monkeypatch.setenv(k, v)
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+    work = tmp_path / "work"
+    subprocess.run(["git", "clone", "-q", str(origin), str(work)], check=True)
+    (work / "a.txt").write_text("base\n")
+    _git(work, "add", "."); _git(work, "commit", "-q", "-m", "base"); _git(work, "branch", "-M", "main")
+    _git(work, "switch", "-q", "-c", "feature"); (work / "a.txt").write_text("feature\n")
+    _git(work, "commit", "-q", "-am", "feature"); _git(work, "switch", "-q", "main")
+    _git(work, "merge", "-q", "--no-ff", "-m", "Merge pull request #1 from x/feature", "feature")
+    merge = _git(work, "rev-parse", "HEAD")
+    _git(work, "push", "-q", "origin", "main")
+    # a true revert branch
+    _git(work, "switch", "-q", "-c", "maintainer/revert-x"); _git(work, "revert", "--no-edit", "-m", "1", merge)
+    revert_head = _git(work, "rev-parse", "HEAD"); _git(work, "push", "-q", "origin", "maintainer/revert-x")
+    # and a branch that claims to be a revert but is not
+    _git(work, "switch", "-q", "-c", "maintainer/fake", "main"); (work / "b.txt").write_text("x\n")
+    _git(work, "add", "."); _git(work, "commit", "-q", "-m", "not a revert")
+    fake_head = _git(work, "rev-parse", "HEAD"); _git(work, "push", "-q", "origin", "maintainer/fake")
+
+    policy = load_policy()
+    pull = load("pr84_pull.json")
+    snap = build_snapshot("JiusiServe/InferMatrixCopilot", pull=pull, files=load("pr84_files.json"), reviews=[],
+                          comments=[], commits=load("pr84_commits.json"), check_runs=load("pr84_checkruns.json"),
+                          max_files=3000)
+    rollback = replace(snap, labels=("maintainer:rollback",), title="revert: whatever the routine wrote")
+
+    class NoGh:
+        def api(self, *a, **k):
+            raise AssertionError("no issue or API read is needed for revert facts on a non-deploying repo")
+
+    empty, tip_ok = cli._revert_facts(NoGh(), policy, replace(rollback, head_sha=revert_head), str(work),
+                                      repo_config(policy, "JiusiServe/InferMatrixCopilot"))
+    assert (empty, tip_ok) == (True, True)
+    empty, _ = cli._revert_facts(NoGh(), policy, replace(rollback, head_sha=fake_head), str(work),
+                                 repo_config(policy, "JiusiServe/InferMatrixCopilot"))
+    assert empty is False
+    # after main advances, even the true revert no longer restores the live tip's parent
+    _git(work, "switch", "-q", "main"); (work / "c.txt").write_text("later\n")
+    _git(work, "add", "."); _git(work, "commit", "-q", "-m", "later"); _git(work, "push", "-q", "origin", "main")
+    empty, _ = cli._revert_facts(NoGh(), policy, replace(rollback, head_sha=revert_head), str(work),
+                                 repo_config(policy, "JiusiServe/InferMatrixCopilot"))
+    assert empty is False
+
+
 def test_work_queue_ordering_and_rfc_gate():
     policy = load_policy()
     issues = {"JiusiServe/InferMatrixCopilot": [

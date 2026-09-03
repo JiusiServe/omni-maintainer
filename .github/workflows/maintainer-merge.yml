@@ -4,7 +4,11 @@
 # every merge decision across repositories, and each candidate is
 # re-evaluated on a fresh snapshot immediately before `gh pr merge
 # --match-head-commit`, so the daily cap and every other rule are decided
-# atomically. Replace every <PIN-SHA> before merging this file.
+# atomically.
+#
+# The evaluator is installed from this repository's own `main` checkout:
+# `main` is ruleset-protected and human-merge-only, so the checkout IS the
+# pin (a commit SHA would have to point at itself).
 name: maintainer-merge
 
 on:
@@ -27,21 +31,26 @@ jobs:
     steps:
       - name: Mint the gate App token
         id: app
-        uses: actions/create-github-app-token@<PIN-SHA> # v2
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
         with:
           app-id: ${{ secrets.GATE_APP_ID }}
           private-key: ${{ secrets.GATE_APP_PRIVATE_KEY }}
           owner: JiusiServe
           repositories: omni-reviewbot,InferMatrixCopilot,omni-maintainer
 
-      - uses: actions/setup-python@<PIN-SHA> # v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: main
+          persist-credentials: false
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
 
-      - name: Install the pinned evaluator
-        env:
-          OMNI_MAINTAINER_SHA: "<PIN-SHA>"
-        run: python -m pip install --quiet "git+https://github.com/JiusiServe/omni-maintainer@${OMNI_MAINTAINER_SHA}"
+      - name: Install the evaluator from main
+        run: |
+          python -m pip install --quiet .
+          python -m omni_maintainer --version
 
       - name: Merge Tier A pull requests that pass a fresh, complete bar
         env:
@@ -49,4 +58,4 @@ jobs:
         # --workdir is a directory into which the arbiter clones each Tier A
         # repository's bare objects (no checkout, nothing executed) so revert
         # PRs can be verified against the recorded pre-merge commit.
-        run: python -m omni_maintainer gate arbiter --workdir work
+        run: python -m omni_maintainer gate arbiter --workdir "$RUNNER_TEMP/work"

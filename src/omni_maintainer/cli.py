@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
-from .config import PolicyError, load_policy, repo_config
+from .config import PolicyError, RepoConfig, load_policy, repo_config
 from .gate import merge as gate_merge
 from .gate.actors import human_pause_active
 from .gate.bar import BarInputs, evaluate
@@ -32,7 +32,7 @@ from .monitor.fingerprint import classify, excerpt, fingerprint
 from .monitor.issues import (UnsafeText, add_labels, close_issue, comment_issue, create_issue,
                              ensure_safe, find_issue_by_marker, fingerprint_marker, remove_labels,
                              render_failure_body)
-from .monitor.pushes import INCIDENT_KINDS, classify_commit, new_commits_since
+from .monitor.pushes import HISTORY_REWRITTEN, INCIDENT_KINDS, classify_commit, new_commits_since
 from .routine.ghcli import Gh, GhError, git
 from .routine.ledger import parse_cursors, render_ledger, replace_cursors
 from .routine.preflight import Preflight, PreflightError, run_preflight
@@ -41,9 +41,10 @@ from .routine.release import (ReleaseError, handshake_check, pin_bump_preconditi
 from .routine.workqueue import build_queue, stale_decisions
 
 EXIT_OK = 0
-EXIT_FAIL = 1
+EXIT_FAIL = 1        # the decision was made and published: the bar failed
 EXIT_USAGE = 2
 EXIT_PAUSED = 3
+EXIT_CRASH = 4       # no trustworthy decision could be read or published; the job must fail
 
 
 def _now() -> datetime:
@@ -91,34 +92,46 @@ def _ensure_objects(repo: str, root: str) -> str:
     return str(target)
 
 
-def _revert_facts(gh: Gh, policy: dict[str, Any], snapshot: PullSnapshot, workdir: str | None) -> tuple[bool | None, bool | None]:
-    """For a revert PR: (diff empty against pre-merge, main still at the merge)."""
+def _revert_facts(gh: Gh, policy: dict[str, Any], snapshot: PullSnapshot, workdir: str | None,
+                  repo_cfg: RepoConfig | None = None) -> tuple[bool | None, bool | None]:
+    """For a revert PR: (tree restores what the live tip replaced, tip is a deployed merge).
+
+    Every fact is rederived from immutable data, never from an issue body:
+    the reverted merge is the current tip of ``main``; the tree it replaced
+    is its first parent's; for a deploying repository the tip must also be
+    the head of a successful push deploy run. A revert of anything but the
+    live tip is "main advanced" and needs a human.
+    """
     labels = policy["labels"]
     if labels["rollback"] not in snapshot.labels:
         return None, None
-    if workdir:
-        # A repository checkout inside ``workdir`` or the directory itself.
-        candidate = Path(workdir)
-        if not (candidate / ".git").is_dir():
-            workdir = _ensure_objects(snapshot.repo, workdir)
-    record = None
-    canaries = gh.api(f"repos/{snapshot.repo}/issues?labels={labels['canary']}&state=all&per_page=100", paginate=True)
-    for issue in canaries or []:
-        rec = canary_mod.CanaryRecord.parse(str(issue.get("body") or ""))
-        if rec and rec.merge_sha and rec.merge_sha[:8] in (snapshot.title + " " + snapshot.head_ref):
-            record = rec
-            break
-    if record is None or not workdir:
+    if not workdir:
         return False, False
-    git(["fetch", "origin", "main", snapshot.head_sha, record.pre_merge_sha], cwd=workdir)
-    empty = git(["diff", "--stat", record.pre_merge_sha, snapshot.head_sha], cwd=workdir).strip() == ""
+    candidate = Path(workdir)
+    if not (candidate / ".git").is_dir():
+        workdir = _ensure_objects(snapshot.repo, workdir)
+    git(["fetch", "origin", "main", snapshot.head_sha], cwd=workdir)
     tip = git(["rev-parse", "origin/main"], cwd=workdir).strip()
-    return empty, tip == record.merge_sha
+    parents = git(["rev-list", "--parents", "-n", "1", tip], cwd=workdir).split()[1:]
+    if not parents:
+        return False, False
+    pre_merge = parents[0]
+    empty = git(["diff", "--stat", pre_merge, snapshot.head_sha], cwd=workdir).strip() == ""
+    tip_is_deployed_merge = True
+    if repo_cfg is not None and repo_cfg.deploys:
+        try:
+            runs = gh.api(f"repos/{snapshot.repo}/actions/workflows/{repo_cfg.deploy_workflow}/runs"
+                          f"?branch=main&event=push&status=success&per_page=20")
+        except GhError:
+            runs = {}
+        tip_is_deployed_merge = any(str(r.get("head_sha") or "").lower() == tip.lower()
+                                    for r in (runs or {}).get("workflow_runs", []))
+    return empty, tip_is_deployed_merge
 
 
 def _bar_inputs(gh: Gh, policy: dict[str, Any], snapshot: PullSnapshot, workdir: str | None) -> tuple[BarInputs, Preflight]:
     pre = run_preflight(gh, policy, now=_now())
-    empty, tip_ok = _revert_facts(gh, policy, snapshot, workdir)
+    empty, tip_ok = _revert_facts(gh, policy, snapshot, workdir, repo_config(policy, snapshot.repo))
     return BarInputs(now=pre.now, merges_today=pre.merges_today, paused=pre.paused,
                      deploy_hold=pre.deploy_hold, open_canary=pre.open_canary,
                      revert_verified_empty=empty, base_tip_is_reverted_merge=tip_ok), pre
@@ -131,18 +144,32 @@ def cmd_gate_evaluate(args: argparse.Namespace, policy: dict[str, Any], gh: Gh) 
         inputs, _ = _bar_inputs(gh, policy, snapshot, args.workdir)
     except (IncompleteRead, PreflightError, GhError) as exc:
         # Fail closed: publish a failing check that names the read problem.
+        # If even that cannot be published, the job must fail (EXIT_CRASH):
+        # an earlier successful check on the same head would otherwise keep
+        # standing while a new objection or hold goes unrecorded.
         from .gate.bar import BarResult
         result = BarResult(ok=False, failures=[f"gate could not read GitHub completely: {exc}"])
         if args.publish and getattr(args, "head", ""):
-            gate_merge.publish_check(gh, repo=args.repo, head_sha=args.head, result=result)
+            try:
+                gate_merge.publish_check(gh, repo=args.repo, head_sha=args.head, result=result)
+            except GhError as publish_exc:
+                _emit({"ok": False, "summary": result.summary(), "publish_error": str(publish_exc)})
+                return EXIT_CRASH
+            _emit({"ok": False, "summary": result.summary()})
+            return EXIT_FAIL
         _emit({"ok": False, "summary": result.summary()})
-        return EXIT_FAIL
+        return EXIT_CRASH
     # The published check states the PR's own properties; caps and holds
     # apply to autonomous merges and are reported as notes here.
     result = evaluate(snapshot, policy=policy, repo=repo, inputs=inputs, enforce_caps=args.enforce_caps)
     if args.publish:
-        gate_merge.publish_check(gh, repo=args.repo, head_sha=snapshot.head_sha, result=result,
-                                 details_url=args.details_url or "")
+        try:
+            gate_merge.publish_check(gh, repo=args.repo, head_sha=snapshot.head_sha, result=result,
+                                     details_url=args.details_url or "")
+        except GhError as publish_exc:
+            _emit({"ok": result.ok, "head": snapshot.head_sha, "failures": result.failures,
+                   "publish_error": str(publish_exc), "summary": result.summary()})
+            return EXIT_CRASH
     _emit({"ok": result.ok, "head": snapshot.head_sha, "failures": result.failures, "notes": result.notes,
            "carve_outs": result.carve_out_paths, "requires_go": result.requires_go,
            "revert_fast_path": result.is_revert_fast_path, "summary": result.summary()})
@@ -237,23 +264,30 @@ def _fetch_digests(policy: dict[str, Any], now: datetime) -> dict[str, Digest]:
 
 
 def _deploy_run(gh: Gh, repo: str, run_id: int | None) -> tuple[str, str | None]:
+    status, conclusion, _ = _deploy_run_details(gh, repo, run_id)
+    return status, conclusion
+
+
+def _deploy_run_details(gh: Gh, repo: str, run_id: int | None) -> tuple[str, str | None, datetime | None]:
+    """(status, conclusion of the deploy-production job, its server-stamped completion time)."""
     if not run_id:
-        return "unknown", None
+        return "unknown", None, None
     try:
         run = gh.api(f"repos/{repo}/actions/runs/{run_id}")
     except GhError:
-        return "unknown", None
+        return "unknown", None, None
     status = str(run.get("status") or "unknown")
     conclusion = run.get("conclusion")
+    completed_at = parse_time(run.get("updated_at"))
     if status == "completed":
         try:
             jobs = gh.api(f"repos/{repo}/actions/runs/{run_id}/jobs?per_page=100")
             for job in (jobs or {}).get("jobs", []):
                 if job.get("name") == "deploy-production":
-                    return "completed", job.get("conclusion")
+                    return "completed", job.get("conclusion"), parse_time(job.get("completed_at")) or completed_at
         except GhError:
             pass
-    return status, conclusion
+    return status, conclusion, completed_at
 
 
 def _read_cursors(gh: Gh, policy: dict[str, Any], state_file: str | None) -> tuple[dict[str, Any], str]:
@@ -283,6 +317,33 @@ def _write_cursors(gh: Gh, policy: dict[str, Any], state_file: str | None, curso
         return
     gh.write(["issue", "edit", str(number), "-R", policy["ledger"]["repo"], "--body-file", "-"],
              stdin=replace_cursors(body, {**cursors, "last_tick_at": now.isoformat()}))
+
+
+def _verified_pushers(gh: Gh, repo: str, canary_label: str) -> dict[str, str]:
+    """merge_sha → pusher login, from the deploy run's own metadata.
+
+    For each canary record, the referenced Actions run must be a ``push``
+    event whose ``head_sha`` is the record's ``merge_sha``; its ``actor`` is
+    then the server-stamped pusher. A record whose run does not match (or
+    whose ``pusher`` field disagrees with the run) contributes nothing, so a
+    forged or edited record cannot launder a direct push.
+    """
+    out: dict[str, str] = {}
+    for issue in gh.api(f"repos/{repo}/issues?labels={canary_label}&state=all&per_page=100", paginate=True) or []:
+        rec = canary_mod.CanaryRecord.parse(str(issue.get("body") or ""))
+        if not rec or not rec.deploy_run_id:
+            continue
+        try:
+            run = gh.api(f"repos/{repo}/actions/runs/{rec.deploy_run_id}")
+        except GhError:
+            continue
+        actor = str((run.get("actor") or {}).get("login") or "")
+        if str(run.get("event") or "") != "push" or str(run.get("head_sha") or "").lower() != rec.merge_sha.lower():
+            continue
+        if not actor or (rec.pusher and rec.pusher != actor):
+            continue
+        out[rec.merge_sha.lower()] = actor
+    return out
 
 
 def _tick_authors(policy: dict[str, Any]) -> set[str]:
@@ -362,23 +423,31 @@ def cmd_monitor_tick(args: argparse.Namespace, policy: dict[str, Any], gh: Gh) -
         decisions["signals"].append({"signal": "commits_unreadable", "error": str(exc)})
         commits = []
     last_seen = str(cursors.get("rb_main_sha") or "")
-    fresh = new_commits_since(commits or [], last_seen_sha=last_seen) if last_seen else []
-    # Server-stamped pushers: the deploy run's canary record carries
-    # github.actor for its push. Commit metadata is never used for this.
-    pushers: dict[str, str] = {}
-    if fresh:
-        for issue in gh.api(f"repos/{rb}/issues?labels={labels['canary']}&state=all&per_page=100", paginate=True) or []:
-            rec = canary_mod.CanaryRecord.parse(str(issue.get("body") or ""))
-            if rec and rec.pusher:
-                pushers[rec.merge_sha] = rec.pusher
-    def merged_pr_sha(number: int) -> str | None:
+    fresh, found = new_commits_since(commits or [], last_seen_sha=last_seen) if last_seen else ([], True)
+    if last_seen and commits and not found:
+        # The commit we last saw on main is gone from its recent history:
+        # a non-fast-forward update or more than a page of pushes. Both are
+        # incidents until a human looks; an old merge commit could have been
+        # re-pointed to look like an ordinary merge.
+        decisions["pushes"].append({"sha": str(commits[0].get("sha") or ""), "kind": HISTORY_REWRITTEN,
+                                    "pr": None, "pusher": "", "message": f"last seen {last_seen[:8]} not reachable",
+                                    "incident": True, "ack": f"--rb-main-sha {commits[0].get('sha')}"})
+        fresh = []
+    # Server-stamped pushers, verified against immutable Actions run metadata.
+    # The canary record only points at the deploy run; issue bodies are
+    # editable, so the ``pusher`` written there is never trusted by itself.
+    pushers: dict[str, str] = _verified_pushers(gh, rb, labels["canary"]) if fresh else {}
+    def merged_pr_sha(number: int) -> tuple[str, str] | None:
+        """GitHub's record: merged into main, its merge commit sha and who merged it."""
         try:
             pull = gh.api(f"repos/{rb}/pulls/{number}")
         except GhError:
             return None
-        return str(pull.get("merge_commit_sha") or "") if pull.get("merged") else None
+        if not pull.get("merged") or str((pull.get("base") or {}).get("ref") or "") != "main":
+            return None
+        return (str(pull.get("merge_commit_sha") or ""), str((pull.get("merged_by") or {}).get("login") or ""))
 
-    incident_pushes = 0
+    incident_pushes = sum(1 for p in decisions["pushes"] if p.get("incident"))
     for commit in fresh:
         cls = classify_commit(commit, merged_pr_sha=merged_pr_sha, pushers=pushers,
                               humans=policy["identities"].get("humans") or ())
@@ -418,8 +487,8 @@ def cmd_monitor_tick(args: argparse.Namespace, policy: dict[str, Any], gh: Gh) -
         if not trusted:
             decisions["notes"].append("identities.routine_login is unset: no prior tick is trusted "
                                       "(set it after the probe)")
-        status, conclusion = _deploy_run(gh, rb, record.deploy_run_id)
-        if record.baseline is not None:
+        status, conclusion, deployed_at = _deploy_run_details(gh, rb, record.deploy_run_id)
+        if record.baseline is not None and record.baseline.started_at:
             new_jobs, failed_jobs = canary_mod.jobs_since(record.baseline, digests)
         else:
             new_jobs, failed_jobs = 0, 0
@@ -428,10 +497,12 @@ def cmd_monitor_tick(args: argparse.Namespace, policy: dict[str, Any], gh: Gh) -
         current = canary_mod.TickView.parse(tick.to_marker(), watcher_multiplier=float(m["watcher_dead_multiplier"]))
         decision = canary_mod.evaluate(record, ticks + ([current] if current else []), now=now, policy=policy)
         entry = {"issue": issue.get("number"), "merge_sha": record.merge_sha, "action": decision.action,
-                 "reason": decision.reason, "details": decision.details}
+                 "reason": decision.reason, "details": decision.details,
+                 "deployed_at": deployed_at.isoformat() if deployed_at else None}
         decisions["canaries"].append(entry)
         if args.apply:
-            _apply_canary(gh, policy, rb, int(issue["number"]), record, tick, decision, digests, now)
+            _apply_canary(gh, policy, rb, int(issue["number"]), record, tick, decision, digests, now,
+                          deployed_at=deployed_at)
 
     # Rollbacks: advance every open incident through its state machine so a
     # tripped canary does not stay open forever and block the next deploy.
@@ -445,12 +516,17 @@ def cmd_monitor_tick(args: argparse.Namespace, policy: dict[str, Any], gh: Gh) -
 
 
 def _apply_canary(gh: Gh, policy: dict[str, Any], repo: str, number: int, record: canary_mod.CanaryRecord,
-                  tick: canary_mod.Tick, decision: canary_mod.Decision, digests: dict[str, Digest], now: datetime) -> None:
+                  tick: canary_mod.Tick, decision: canary_mod.Decision, digests: dict[str, Digest], now: datetime,
+                  *, deployed_at: datetime | None = None) -> None:
     labels = policy["labels"]
     comment_issue(gh, repo=repo, number=number,
                   body=f"tick {now.replace(microsecond=0).isoformat()}: **{decision.action}** — {decision.reason}\n\n{tick.to_marker()}")
     if decision.action == canary_mod.START:
-        record.baseline = canary_mod.baseline_from(digests, started_at=now)
+        # The baseline is the one the deploy job captured before deploying
+        # (evaluate() holds without it). The window starts at the deploy
+        # job's server-stamped completion time, not when this tick happened
+        # to observe it.
+        record.baseline = canary_mod.open_window(record.baseline, started_at=deployed_at or now)
         record.status = "running"
         _rewrite_canary_body(gh, repo, number, record)
     elif decision.action == canary_mod.CLOSE:
@@ -901,8 +977,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return int(args.func(args, policy, gh))
     except GhError as exc:
+        # An unhandled GitHub failure means no decision was made or recorded.
         _emit({"ok": False, "error": str(exc)})
-        return EXIT_FAIL
+        return EXIT_CRASH
 
 
 if __name__ == "__main__":

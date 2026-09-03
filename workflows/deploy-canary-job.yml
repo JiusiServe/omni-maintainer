@@ -24,11 +24,18 @@
 #   - another canary window, incident or rollback is still open
 #     (one active deployment through the full canary window), or
 #   - the record cannot be created.
-# Rollback exception: a push is admitted despite open items when it is the
-# merge of the revert PR named by an open incident's rollback marker AND the
-# merge's second parent equals that marker's expected revert sha.
+# Rollback exception: a push is admitted despite open items only when
+#   (a) GitHub's own record says the pushed commit is the merge of a pull
+#       request labeled maintainer:rollback into main, and
+#   (b) the pushed commit's TREE equals the tree that the currently live
+#       deployment replaced: the first parent of the head commit of the
+#       newest successful push run of this workflow on main (Actions run
+#       metadata, immutable). No issue, label or marker is consulted, and a
+#       match against some older deployment proves nothing.
 # Retry: once the open window closes, re-run the failed run from the Actions
-# UI ("Re-run failed jobs" keeps the push context), or push again.
+# UI ("Re-run failed jobs" keeps the push context; the first step still
+# requires main to be at this commit), or push again. A rerun is a new
+# deploy attempt with its own record (run id + run_attempt).
 jobs:
   canary-record:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.PRODUCTION_DEPLOY_ENABLED == 'true'
@@ -37,10 +44,15 @@ jobs:
     concurrency:
       group: reviewbot-canary-record
       cancel-in-progress: false
+    # Job-level permissions REPLACE the workflow-level set for this job, so
+    # every read this job performs is listed: branch tip and commit trees
+    # (contents), PR association (pull-requests), run metadata (actions),
+    # and the canary issue itself (issues: write).
     permissions:
       contents: read
       issues: write
       pull-requests: read
+      actions: read
     steps:
       - name: Refuse a stale run (main must still be at this commit; re-runs after main advanced deploy nothing)
         env:
@@ -74,34 +86,48 @@ jobs:
                                     f"repos/{repo}/issues?labels={label}&state={state}&per_page=100"))
               return [i for page in pages for i in page if "pull_request" not in i]
 
-          # Is this push the merge of a revert PR that an open incident is waiting for?
+          # Is this push a rollback that provably restores a previously deployed tree?
+          # (a) GitHub's association: which PR does this commit merge, and is it a rollback PR into main?
           rollback_ok = False
-          pr_match = re.match(r"^Merge pull request #(\d+)", message)
-          if pr_match:
-              pushed_pr = int(pr_match.group(1))
-              commit = json.loads(gh("api", f"repos/{repo}/commits/{merge_sha}"))
-              parents = [p["sha"] for p in commit.get("parents", [])]
-              for incident in issues("maintainer:incident"):
-                  texts = [incident.get("body") or ""]
-                  texts += [c.get("body") or "" for c in json.loads(gh(
-                      "api", "--paginate", f"repos/{repo}/issues/{incident['number']}/comments?per_page=100"))]
-                  for text in texts:
-                      m = re.search(r"<!--\s*omni-maintainer:rollback:v1\s+(\{.*?\})\s*-->", text, re.S)
-                      if not m:
-                          continue
-                      rec = json.loads(m.group(1))
-                      if int(rec.get("revert_pr") or 0) == pushed_pr and len(parents) == 2 \
-                              and parents[1] == rec.get("expected_revert_sha"):
+          associated = json.loads(gh("api", f"repos/{repo}/commits/{merge_sha}/pulls"))
+          rollback_prs = [p for p in associated
+                          if p.get("merged_at") and p.get("merge_commit_sha") == merge_sha
+                          and (p.get("base") or {}).get("ref") == "main"
+                          and any(l.get("name") == "maintainer:rollback" for l in p.get("labels") or [])]
+          if rollback_prs:
+              # (b) the pushed tree must equal the tree that the CURRENTLY LIVE deployment
+              # replaced. The live deployment is the newest successful push run of this
+              # workflow on main (Actions run metadata, immutable; no issue is consulted);
+              # the replaced tree is that run's head commit's first parent. A tree that
+              # matches some older deployment proves nothing about the affected one.
+              pushed_tree = json.loads(gh("api", f"repos/{repo}/commits/{merge_sha}"))["commit"]["tree"]["sha"]
+              workflow_file = os.path.basename(os.environ.get("GITHUB_WORKFLOW_REF", "deploy.yml").split("@")[0])
+              runs = json.loads(gh("api", f"repos/{repo}/actions/workflows/{workflow_file}/runs"
+                                          f"?branch=main&event=push&status=success&per_page=20")).get("workflow_runs", [])
+              live = next((r for r in runs if r.get("head_sha") != merge_sha), None)
+              if live is None:
+                  print("no previous successful deployment found; rollback exception not applicable")
+              else:
+                  deployed = str(live["head_sha"])
+                  deployed_commit = json.loads(gh("api", f"repos/{repo}/commits/{deployed}"))
+                  parents = [p["sha"] for p in deployed_commit.get("parents", [])]
+                  if parents:
+                      pre_tree = json.loads(gh("api", f"repos/{repo}/commits/{parents[0]}"))["commit"]["tree"]["sha"]
+                      if pre_tree == pushed_tree:
                           rollback_ok = True
-                          print(f"admitting rollback deploy: revert PR #{pushed_pr} for incident #{incident['number']}")
+                          print(f"admitting rollback deploy: PR #{rollback_prs[0]['number']} restores the tree that the "
+                                f"live deployment {deployed[:8]} (run {live['id']}) replaced")
+                      else:
+                          print(f"rollback PR does not restore what the live deployment {deployed[:8]} replaced; blocked")
           if rollback_ok:
               sys.exit(0)
 
+          # No exclusion for "our own" open canary: a re-run of this workflow
+          # during its own active window is a second deployment attempt and
+          # must wait for the monitor to close or trip the first record.
           blocking = []
           for label in ("maintainer:canary", "maintainer:incident", "maintainer:rollback"):
               for issue in issues(label):
-                  if label == "maintainer:canary" and f'"merge_sha": "{merge_sha}"' in (issue.get("body") or ""):
-                      continue  # our own record from a re-run
                   blocking.append(f"#{issue['number']} ({label}) {issue.get('title')}")
           if blocking:
               print("deployment blocked; resolve or wait for these to close, then re-run this workflow run:")
@@ -110,12 +136,13 @@ jobs:
           print("no open canary, incident or rollback; proceeding")
           PY
 
-      - name: Record the canary for this deploy (idempotent on merge_sha)
+      - name: Record the canary for this deploy attempt (identity: run id + run attempt)
         env:
           GH_TOKEN: ${{ github.token }}
           MERGE_SHA: ${{ github.sha }}
           PRE_MERGE_SHA: ${{ github.event.before }}
           RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
           HEAD_MESSAGE: ${{ github.event.head_commit.message }}
           # Server-stamped identity of whoever pushed: the only push
           # attribution the monitor trusts (commit metadata is spoofable).
@@ -138,17 +165,70 @@ jobs:
           def gh(*args, stdin=None):
               return subprocess.run(["gh", *args], text=True, capture_output=True, check=True, input=stdin).stdout
 
+          # One record per deploy ATTEMPT (run id + attempt), never shared across
+          # attempts: a rerun that got past the hold gets its own, non-overlapping
+          # record. Re-executing this very attempt (a job retry) finds its record.
+          run_attempt = int(os.environ.get("RUN_ATTEMPT") or 1)
           existing = json.loads(gh("api", "--paginate", "--slurp",
                                    f"repos/{repo}/issues?labels={label}&state=all&per_page=100"))
           for page in existing:
               for issue in page:
-                  if f'"merge_sha": "{merge_sha}"' in (issue.get("body") or ""):
-                      print(f"canary already recorded: #{issue['number']}")
+                  body_text = issue.get("body") or ""
+                  if f'"deploy_run_id": {run_id}' in body_text and f'"run_attempt": {run_attempt}' in body_text:
+                      print(f"canary already recorded for this attempt: #{issue['number']}")
                       sys.exit(0)
 
+          # Pre-deploy baseline, captured by this run before deploy-production so
+          # that failures between service start and the monitor's first tick are
+          # attributed to the deploy. The monitor stamps started_at when the
+          # deploy succeeds. There is NO fallback: an hourly monitor cannot take a
+          # pre-deployment reading after the fact, so if either dashboard cannot
+          # be read (three attempts) this job fails and nothing deploys.
+          import time, urllib.request
+          readings = {}
+          for name, base in (("vllm_omni", "http://review.43.155.186.30.nip.io/code_review/vllm_omni"),
+                             ("vllm_gr", "http://review.43.155.186.30.nip.io/code_review/vllm_gr")):
+              last = None
+              for attempt in range(3):
+                  try:
+                      with urllib.request.urlopen(base + "/api/status", timeout=90) as resp:
+                          payload = json.loads(resp.read().decode("utf-8"))
+                      if not isinstance(payload, dict) or "jobs" not in payload or "history" not in payload:
+                          raise ValueError("malformed status payload")
+                      readings[name] = payload
+                      break
+                  except Exception as exc:  # noqa: BLE001
+                      last = exc
+                      time.sleep(30)
+              if name not in readings:
+                  print(f"pre-deploy baseline unavailable for {name}: {last}; refusing to deploy without one", file=sys.stderr)
+                  sys.exit(1)
+          if True:
+              primary = readings["vllm_omni"]
+              days = (primary.get("history") or {}).get("days") or []
+              done = days[:-1] if len(days) > 1 else days
+              attention = [int(d.get("attention") or 0) for d in done]
+              gate = [int(d.get("gate_failures") or 0) for d in done]
+              baseline = {
+                  "mean_attention": (sum(attention) / len(attention)) if attention else 0.0,
+                  "max_attention": max(attention) if attention else 0,
+                  "mean_gate_failures": (sum(gate) / len(gate)) if gate else 0.0,
+                  "counts_failed": sum(int((r.get("counts") or {}).get("failed") or 0) for r in readings.values()),
+                  "review_failed": sum(int(((r.get("review_stats") or {}).get("outcomes") or {}).get("failed") or 0)
+                                       for r in readings.values()),
+                  "gate_failures": sum(int((r.get("review_stats") or {}).get("gate_failures") or 0) for r in readings.values()),
+                  "split_failed": sum(int(((r.get("split") or {}).get("attempts") or {}).get("failed") or 0)
+                                      for r in readings.values()),
+                  "last_scan_at": (primary.get("metadata") or {}).get("last_scan_at"),
+                  "started_at": "",
+                  "captured_at": datetime.now(timezone.utc).isoformat(),
+                  "max_job_ids": {name: max((int(j.get("id") or 0) for j in r.get("jobs") or []), default=0)
+                                  for name, r in readings.items()},
+              }
           record = {"repo": repo, "merge_sha": merge_sha, "pre_merge_sha": pre, "pr_number": pr_number,
-                    "deploy_run_id": run_id, "opened_at": datetime.now(timezone.utc).isoformat(),
-                    "kind": "rb", "status": "pending", "baseline": None, "pusher": pusher}
+                    "deploy_run_id": run_id, "run_attempt": run_attempt,
+                    "opened_at": datetime.now(timezone.utc).isoformat(),
+                    "kind": "rb", "status": "pending", "baseline": baseline, "pusher": pusher}
           body = "\n".join([
               f"Deploy of `{merge_sha}` (previous `{pre}`), run {os.environ['GITHUB_SERVER_URL']}/{repo}/actions/runs/{run_id}",
               f"PR: #{pr_number}" if pr_number else "PR: (direct push)",

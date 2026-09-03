@@ -23,15 +23,18 @@ from typing import Any, Callable, Iterable
 
 _MERGE_MESSAGE = re.compile(r"^Merge pull request #(?P<number>\d+)\b")
 
-PR_MERGE = "pr_merge"
-DIRECT_HUMAN = "direct_push_human"          # pusher proven by a server-stamped canary record
+PR_MERGE = "pr_merge"                       # merged into main by an allowlisted human (GitHub's record)
+PR_MERGE_UNATTRIBUTED = "pr_merge_unattributed"  # GitHub confirms the merge, but not by an allowlisted human
+DIRECT_HUMAN = "direct_push_human"          # pusher proven by immutable run metadata
 DIRECT_UNATTRIBUTED = "direct_push_unattributed"
 FORGED_MERGE = "forged_merge_message"       # claims a PR merge GitHub does not confirm
+HISTORY_REWRITTEN = "history_rewritten"     # the last seen main commit is no longer reachable
 
-INCIDENT_KINDS = frozenset({DIRECT_UNATTRIBUTED, FORGED_MERGE})
+INCIDENT_KINDS = frozenset({DIRECT_UNATTRIBUTED, FORGED_MERGE, PR_MERGE_UNATTRIBUTED, HISTORY_REWRITTEN})
 
-# pr_number -> merge_commit_sha of that PR when GitHub reports it merged, else None
-MergeLookup = Callable[[int], "str | None"]
+# pr_number -> (merge_commit_sha, merged_by login) when GitHub reports the PR
+# merged into main, else None
+MergeLookup = Callable[[int], "tuple[str, str] | None"]
 
 
 @dataclass(frozen=True)
@@ -53,29 +56,37 @@ def classify_commit(commit: dict[str, Any], *, merged_pr_sha: MergeLookup,
     message = str(((commit.get("commit") or {}).get("message")) or "")
     first = message.splitlines()[0] if message else ""
     parents = commit.get("parents") or []
-    pusher = (pushers or {}).get(sha, "")
+    pusher = (pushers or {}).get(sha.lower(), "")
     match = _MERGE_MESSAGE.match(first)
     if match and len(parents) >= 2:
         number = int(match.group("number"))
         recorded = merged_pr_sha(number)
-        if recorded and recorded.lower() == sha.lower():
-            return CommitClass(sha, PR_MERGE, number, pusher, first[:120])
+        if recorded and recorded[0].lower() == sha.lower():
+            merged_by = recorded[1]
+            if merged_by and merged_by in set(humans):
+                return CommitClass(sha, PR_MERGE, number, merged_by, first[:120])
+            # Either App can merge a PR too; on Tier B only humans may.
+            return CommitClass(sha, PR_MERGE_UNATTRIBUTED, number, merged_by, first[:120])
         return CommitClass(sha, FORGED_MERGE, number, pusher, first[:120])
     if pusher and pusher in set(humans):
         return CommitClass(sha, DIRECT_HUMAN, None, pusher, first[:120])
     return CommitClass(sha, DIRECT_UNATTRIBUTED, None, pusher, first[:120])
 
 
-def new_commits_since(commits: list[dict[str, Any]], *, last_seen_sha: str) -> list[dict[str, Any]]:
-    """Commits newer than ``last_seen_sha`` in a newest-first list, oldest first.
+def new_commits_since(commits: list[dict[str, Any]], *, last_seen_sha: str) -> tuple[list[dict[str, Any]], bool]:
+    """(commits newer than ``last_seen_sha``, oldest first; whether it was found).
 
-    When the last seen sha is not in the page, every commit in the page is
-    returned; the caller treats that as "history moved further than one page"
-    and reports it.
+    ``commits`` is GitHub's newest-first listing of ``main``. When the last
+    seen sha is absent, either more than a page landed since the last tick
+    or history was rewritten (a non-fast-forward update); the caller treats
+    both as ``history_rewritten`` until a human confirms, because a rewrite
+    can reuse an old merge commit to look like an ordinary merge.
     """
     out: list[dict[str, Any]] = []
+    found = False
     for commit in commits:
         if str(commit.get("sha") or "") == last_seen_sha:
+            found = True
             break
         out.append(commit)
-    return list(reversed(out))
+    return list(reversed(out)), found

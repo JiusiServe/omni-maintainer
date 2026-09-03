@@ -47,11 +47,19 @@ class Baseline:
     # the deploy"; one shared number would let one busy instance hide the
     # other's failures, and an undeclared field would be lost on reload.
     max_job_ids: dict[str, int] = field(default_factory=dict)
+    # When the pre-deploy reading was taken. Failures are attributed to the
+    # deploy from this instant, not from ``started_at`` (the first
+    # post-deploy tick), so nothing between the two is lost.
+    captured_at: str = ""
 
     def to_json(self) -> dict[str, Any]:
         data = self.__dict__.copy()
         data["max_job_ids"] = dict(self.max_job_ids)
         return data
+
+    @property
+    def failures_from(self) -> datetime | None:
+        return parse_time(self.captured_at) or parse_time(self.started_at)
 
     @classmethod
     def from_json(cls, data: dict[str, Any]) -> "Baseline":
@@ -67,6 +75,7 @@ class Baseline:
             last_scan_at=data.get("last_scan_at"),
             started_at=str(data.get("started_at") or ""),
             max_job_ids={str(k): int(v) for k, v in raw_ids.items()} if isinstance(raw_ids, dict) else {},
+            captured_at=str(data.get("captured_at") or ""),
         )
 
 
@@ -199,8 +208,15 @@ class Decision:
     details: dict[str, Any] = field(default_factory=dict)
 
 
-def baseline_from(digests: dict[str, Digest], *, started_at: datetime) -> Baseline:
-    """Baseline from the primary instance's 14-day history, excluding today."""
+def baseline_from(digests: dict[str, Digest], *, started_at: datetime | None,
+                  captured_at: datetime | None = None) -> Baseline:
+    """Baseline from the primary instance's history: every completed day the
+    dashboard reports (its 14-day window minus today, i.e. 13 full days),
+    plus the absolute counters and per-instance job cursors at capture time.
+
+    ``started_at`` is None when captured before the deploy (by the deploy
+    run or by a pre-deploy tick); the window opens when it is set.
+    """
     primary = digests.get("vllm_omni") or next(iter(digests.values()))
     days = list(primary.history_days)[:-1] if len(primary.history_days) > 1 else list(primary.history_days)
     attention = [int(d.get("attention") or 0) for d in days]
@@ -214,28 +230,39 @@ def baseline_from(digests: dict[str, Digest], *, started_at: datetime) -> Baseli
         gate_failures=sum(d.gate_failures for d in digests.values()),
         split_failed=sum(d.split_failed for d in digests.values()),
         last_scan_at=primary.last_scan_at.isoformat() if primary.last_scan_at else None,
-        started_at=started_at.isoformat(),
+        started_at=started_at.isoformat() if started_at else "",
         max_job_ids={name: d.max_job_id for name, d in digests.items()},
+        captured_at=(captured_at or started_at or primary.fetched_at).isoformat(),
     )
+
+
+def open_window(baseline: Baseline, *, started_at: datetime) -> Baseline:
+    """The same pre-deploy baseline with the window start stamped on it;
+    ``captured_at`` (the earlier pre-deploy instant) is kept."""
+    return Baseline(**{**baseline.__dict__, "max_job_ids": dict(baseline.max_job_ids),
+                       "started_at": started_at.isoformat(),
+                       "captured_at": baseline.captured_at or started_at.isoformat()})
 
 
 def jobs_since(baseline: Baseline, digests: dict[str, Digest]) -> tuple[int, int]:
     """(new jobs, failed jobs) across instances since the window start.
 
     New jobs are counted by id above the per-instance baseline (traffic);
-    failures by ``updated_at`` after the window start, so a job that was
-    already running at deploy time and failed afterwards is attributed to
+    failures by ``updated_at`` after the pre-deploy capture instant
+    (``captured_at``, falling back to ``started_at``), so a job that was
+    already running at deploy time and failed afterwards, or one that failed
+    between the capture and the first post-deploy tick, is attributed to
     the deploy.
     """
     from .dashboard import new_failed_jobs
 
-    started = parse_time(baseline.started_at)
+    since = baseline.failures_from
     new_total = 0
     failed_total = 0
     for name, d in digests.items():
         cursor = int(baseline.max_job_ids.get(name, 0))
         new_total += sum(1 for j in d.jobs if int(j.get("id") or 0) > cursor)
-        failed_total += len(new_failed_jobs(d.jobs, after=started))
+        failed_total += len(new_failed_jobs(d.jobs, after=since))
     return new_total, failed_total
 
 
@@ -251,22 +278,30 @@ def evaluate(record: CanaryRecord, ticks: list[TickView], *, now: datetime,
     current = ticks[-1]
     c = policy["canary"]
 
-    # Before the window: only the deploy run matters.
-    if record.baseline is None:
+    # Before the window: only the deploy run matters. ``record.baseline`` is
+    # captured by the deploy run itself before deploy-production (its
+    # ``started_at`` is empty until the window opens); a record without one
+    # gets the first tick's reading, which is still pre-deploy while the run
+    # is queued or in progress.
+    if record.baseline is None or not record.baseline.started_at:
         if current.deploy_status == "completed":
             if current.deploy_conclusion == "success":
+                if record.baseline is None:
+                    # The deploy job captures the baseline before deploying and
+                    # fails without one; a record lacking it is not something
+                    # the monitor can repair after the fact.
+                    return Decision(HOLD, "deploy succeeded but the record carries no pre-deploy baseline; "
+                                          "the window cannot be judged", {"rule": "no_baseline"})
                 return Decision(START, "deploy run succeeded; window starts")
-            if current.deploy_conclusion == "failure":
-                # server-deploy.sh restores the previous release on its own
-                # failure path; that is the only conclusion with that evidence.
-                return Decision(DEPLOY_FAILED, "deploy run failed; the host's own rollback path ran",
-                                {"rule": "deploy_failed", "conclusion": "failure"})
-            # cancelled, timed_out, skipped, neutral, or a job that never ran:
-            # the host may be in either release. Hold for a human; never
-            # assume a restoration nobody observed.
-            return Decision(HOLD, f"deploy run ended {current.deploy_conclusion!r} without a success or failure "
-                                  "conclusion; production state unverified",
-                            {"rule": "deploy_incomplete", "conclusion": current.deploy_conclusion})
+            # Any non-success conclusion, failure included, leaves the host in
+            # an unverified state: the job can fail before the deploy script
+            # runs, and the script's own restore path emits no success
+            # evidence we can read. Hold for a human; never assume a
+            # restoration nobody observed.
+            rule = "deploy_failed" if current.deploy_conclusion == "failure" else "deploy_incomplete"
+            return Decision(HOLD, f"deploy run ended {current.deploy_conclusion!r}; production state unverified "
+                                  "(the host's restore path may or may not have run)",
+                            {"rule": rule, "conclusion": current.deploy_conclusion})
         opened = parse_time(record.opened_at)
         if current.deploy_status == "waiting" and opened is not None and \
                 now - opened > timedelta(hours=float(c["deploy_waiting_hold_hours"])):
@@ -323,8 +358,13 @@ def evaluate(record: CanaryRecord, ticks: list[TickView], *, now: datetime,
                         {"rule": "scan_regression", "count": regressions})
 
     # Close rules.
-    if hours_open >= float(c["max_hours"]):
-        return Decision(CLOSE, f"window hit the {c['max_hours']} h cap", {"outcome": "passed"})
     if len(window) >= int(c["min_ticks"]) and current.new_jobs_total >= int(c["min_new_jobs"]):
         return Decision(CLOSE, "window passed with enough traffic", {"outcome": "passed"})
+    if hours_open >= float(c["max_hours"]):
+        # Fail closed at the cap: a service that saw fewer jobs than the
+        # minimum in a whole day is itself anomalous, so the window ends in
+        # a hold that a human closes after verifying production.
+        return Decision(HOLD, f"window hit the {c['max_hours']} h cap with only {current.new_jobs_total} new jobs "
+                              f"(minimum {c['min_new_jobs']}); production unverified",
+                        {"rule": "low_traffic", "new_jobs": current.new_jobs_total})
     return Decision(WAIT, f"{len(window)} ticks, {current.new_jobs_total} new jobs; window continues")

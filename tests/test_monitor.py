@@ -10,7 +10,7 @@ from omni_maintainer.monitor.dashboard import Fetch, digest, job_time, new_faile
 from omni_maintainer.monitor.fingerprint import classify, excerpt, fingerprint, normalize
 from omni_maintainer.monitor.issues import CREDENTIAL_PATTERNS, UnsafeText, credential_reason, ensure_safe, render_failure_body
 from omni_maintainer.monitor.pushes import (DIRECT_HUMAN, DIRECT_UNATTRIBUTED, FORGED_MERGE, INCIDENT_KINDS, PR_MERGE,
-                                            classify_commit, new_commits_since)
+                                            PR_MERGE_UNATTRIBUTED, classify_commit, new_commits_since)
 from conftest import load
 
 from dataclasses import replace
@@ -102,15 +102,21 @@ def test_canary_lifecycle_start_trip_close(policy):
 
     running = view(canary.Tick(NOW, digests, "in_progress", None, 0, 0))
     assert canary.evaluate(record, [running], now=NOW, policy=policy).action == canary.WAIT
+    # no non-success conclusion is ever read as "the host rolled back": all hold for a human
     failed = view(canary.Tick(NOW, digests, "completed", "failure", 0, 0))
-    assert canary.evaluate(record, [failed], now=NOW, policy=policy).action == canary.DEPLOY_FAILED
-    # any other terminal conclusion is a hold, never an assumed restoration
+    d = canary.evaluate(record, [failed], now=NOW, policy=policy)
+    assert d.action == canary.HOLD and d.details["rule"] == "deploy_failed"
     for conclusion in ("cancelled", "timed_out", "skipped", None):
         odd = view(canary.Tick(NOW, digests, "completed", conclusion, 0, 0))
         d = canary.evaluate(record, [odd], now=NOW, policy=policy)
         assert d.action == canary.HOLD and d.details["rule"] == "deploy_incomplete"
     ok = view(canary.Tick(NOW, digests, "completed", "success", 0, 0))
+    # a record without the job-captured baseline cannot start a window: hold
+    d = canary.evaluate(record, [ok], now=NOW, policy=policy)
+    assert d.action == canary.HOLD and d.details["rule"] == "no_baseline"
+    record.baseline = canary.baseline_from(digests, started_at=None)
     assert canary.evaluate(record, [ok], now=NOW, policy=policy).action == canary.START
+    record.baseline = None
     # the record carries the server-stamped pusher through the marker
     stamped = canary.CanaryRecord.parse(canary.CanaryRecord(
         repo="r", merge_sha="a" * 40, pre_merge_sha="b" * 40, pr_number=None, deploy_run_id=1,
@@ -127,7 +133,8 @@ def test_canary_lifecycle_start_trip_close(policy):
     # traffic since the deploy is by id; failures since by update time
     assert canary.jobs_since(record.baseline, digests) == (0, 0)
     aged = replace(record.baseline, max_job_ids={k: 0 for k in record.baseline.max_job_ids},
-                   started_at=(NOW - timedelta(days=30)).isoformat())
+                   started_at=(NOW - timedelta(days=30)).isoformat(),
+                   captured_at=(NOW - timedelta(days=30)).isoformat())
     new_jobs, failed_jobs = canary.jobs_since(aged, digests)
     assert new_jobs == sum(len(d.jobs) for d in digests.values()) and failed_jobs == 3
     h1, h2, h3 = (NOW + timedelta(hours=i) for i in (1, 2, 3))
@@ -142,12 +149,33 @@ def test_canary_lifecycle_start_trip_close(policy):
              for i, h in enumerate((h1, h2, h3), start=1)]
     d = canary.evaluate(record, ticks, now=h3, policy=policy)
     assert d.action == canary.CLOSE
-    # not enough traffic keeps it open, the 24 h cap closes it anyway
+    # not enough traffic keeps it open; at the 24 h cap it fails closed into a hold
     quiet = [view(canary.Tick(h, _fresh(digests, h), "completed", "success", 1, 0)) for h in (h1, h2, h3)]
     assert canary.evaluate(record, quiet, now=h3, policy=policy).action == canary.WAIT
     late = NOW + timedelta(hours=25)
-    assert canary.evaluate(record, quiet + [view(canary.Tick(late, _fresh(digests, late), "completed", "success", 1, 0))],
-                           now=late, policy=policy).action == canary.CLOSE
+    capped = canary.evaluate(record, quiet + [view(canary.Tick(late, _fresh(digests, late), "completed", "success", 1, 0))],
+                             now=late, policy=policy)
+    assert capped.action == canary.HOLD and capped.details["rule"] == "low_traffic"
+    # a pre-deploy baseline (no started_at yet) keeps the canary in the pre-window phase
+    pre = canary.baseline_from(digests, started_at=None)
+    assert pre.started_at == "" and canary.Baseline.from_json(pre.to_json()).max_job_ids == pre.max_job_ids
+    record.baseline = pre
+    assert canary.evaluate(record, [view(canary.Tick(NOW, digests, "in_progress", None, 0, 0))],
+                           now=NOW, policy=policy).action == canary.WAIT
+    assert canary.evaluate(record, [view(canary.Tick(NOW, digests, "completed", "success", 0, 0))],
+                           now=NOW, policy=policy).action == canary.START
+    opened = canary.open_window(pre, started_at=NOW)
+    assert opened.started_at == NOW.isoformat() and opened.max_job_ids == pre.max_job_ids
+    # failures are attributed from the pre-deploy capture instant, not from the first post-deploy tick
+    captured = NOW - timedelta(hours=2)
+    early = canary.open_window(canary.baseline_from(digests, started_at=None, captured_at=captured), started_at=NOW)
+    assert early.captured_at == captured.isoformat() and early.failures_from == captured
+    between = {name: replace(d, jobs=tuple(d.jobs) + (
+        {"id": 999999, "kind": "review", "status": "failed", "error": "boom",
+         "updated_at": (NOW - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")},)) for name, d in digests.items()}
+    _, failed_between = canary.jobs_since(early, between)
+    _, failed_from_start = canary.jobs_since(replace(early, captured_at=NOW.isoformat()), between)
+    assert failed_between == len(between) and failed_from_start == 0
     # a single new gate failure trips when the 14-day baseline mean is zero
     live = canary.baseline_from(digests, started_at=NOW)
     record.baseline = replace(live, mean_gate_failures=0.0)
@@ -233,9 +261,12 @@ def test_push_classification_uses_server_side_facts_only():
     commits = load("imc_main_commits.json")
     merge_115 = load("pr115_merged_pull.json")  # GitHub's record: merged, merge_commit_sha = c4f96aa…
     assert merge_115["merged"] and merge_115["merge_commit_sha"].startswith("c4f96aa")
-    lookup = lambda n: merge_115["merge_commit_sha"] if n == 115 else None  # noqa: E731
-    kinds = {c["sha"][:7]: classify_commit(c, merged_pr_sha=lookup).kind for c in commits}
+    lookup = lambda n: (merge_115["merge_commit_sha"], "tzhouam") if n == 115 else None  # noqa: E731
+    kinds = {c["sha"][:7]: classify_commit(c, merged_pr_sha=lookup, humans=["tzhouam"]).kind for c in commits}
     assert kinds["c4f96aa"] == PR_MERGE
+    # merged by GitHub's record but not by an allowlisted human (an App, say): incident on Tier B
+    by_app = lambda n: (merge_115["merge_commit_sha"], "some-app[bot]") if n == 115 else None  # noqa: E731
+    assert classify_commit(commits[1], merged_pr_sha=by_app, humans=["tzhouam"]).kind == PR_MERGE_UNATTRIBUTED
     # a direct push is an incident whatever its commit metadata says...
     assert kinds["cbe4d68"] == DIRECT_UNATTRIBUTED and kinds["229ded5"] == DIRECT_UNATTRIBUTED
     # ...unless the deploy run's canary record names an allowlisted human as github.actor
@@ -243,12 +274,15 @@ def test_push_classification_uses_server_side_facts_only():
     direct = next(c for c in commits if c["sha"] == sha)
     assert classify_commit(direct, merged_pr_sha=lookup, pushers={sha: "tzhouam"}, humans=["tzhouam"]).kind == DIRECT_HUMAN
     assert classify_commit(direct, merged_pr_sha=lookup, pushers={sha: "someone"}, humans=["tzhouam"]).kind == DIRECT_UNATTRIBUTED
-    assert classify_commit(commits[1], merged_pr_sha=lookup).pr_number == 115
+    assert classify_commit(commits[1], merged_pr_sha=lookup, humans=["tzhouam"]).pr_number == 115
     # a forged merge message with two parents is an incident when GitHub's PR record disagrees
     forged = {**commits[1], "sha": "f" * 40}
     assert classify_commit(forged, merged_pr_sha=lookup).kind == FORGED_MERGE
     assert classify_commit(commits[1], merged_pr_sha=lambda n: None).kind == FORGED_MERGE
-    assert FORGED_MERGE in INCIDENT_KINDS
-    fresh = new_commits_since(commits, last_seen_sha=commits[2]["sha"])
-    assert [c["sha"][:7] for c in fresh] == ["c4f96aa", "cbe4d68"]
-    assert new_commits_since(commits, last_seen_sha=commits[0]["sha"]) == []
+    assert {FORGED_MERGE, PR_MERGE_UNATTRIBUTED} <= INCIDENT_KINDS
+    fresh, found = new_commits_since(commits, last_seen_sha=commits[2]["sha"])
+    assert found and [c["sha"][:7] for c in fresh] == ["c4f96aa", "cbe4d68"]
+    assert new_commits_since(commits, last_seen_sha=commits[0]["sha"]) == ([], True)
+    # a last-seen commit that vanished from main's history is reported, never silently skipped
+    whole, found = new_commits_since(commits, last_seen_sha="e" * 40)
+    assert not found and len(whole) == len(commits)
