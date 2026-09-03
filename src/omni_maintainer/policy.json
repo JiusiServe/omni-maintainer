@@ -9,6 +9,7 @@
   "identities": {
     "gate_app_slug": "omni-maintainer-gate",
     "ci_app_slug": "github-actions",
+    "workflow_login": "github-actions[bot]",
     "reviewer_login": "omni-maintainer-gate[bot]",
     "gate_merger_logins": ["omni-maintainer-gate[bot]"],
     "routine_login": "",
@@ -132,7 +133,8 @@
     "watcher_dead_multiplier": 3,
     "maintenance_unexpected_ticks": 2,
     "error_excerpt_chars": 400,
-    "fingerprint_quiet_days": 7
+    "fingerprint_quiet_days": 7,
+    "push_lookback_hours": 48
   },
   "canary": {
     "start_grace_minutes": 15,

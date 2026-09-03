@@ -42,6 +42,10 @@ class FakeGh:
             return []
         if re.search(r"/issues/\d+$", path):
             return {"number": 1, "body": "", "labels": []}
+        if "/actions/workflows/" in path and "/runs" in path:
+            return {"workflow_runs": []}
+        if "/compare/main..." in path:
+            return {"status": "identical"}
         raise AssertionError(f"unexpected read: {path}")
 
     def read(self, args, stdin=None):
@@ -69,6 +73,15 @@ def test_gate_evaluate_reports_every_failed_rule(fake, capsys):
     # the check run was published (dry-run) with a failure conclusion
     publish = [w for w in fake.writes if w[:2] == ["api", "repos/JiusiServe/InferMatrixCopilot/check-runs"]]
     assert publish and "-X" in publish[0]
+
+
+def test_pending_check_is_published_before_any_read(fake, capsys):
+    head = fake.pull["head"]["sha"]
+    rc = cli.main(["gate", "evaluate", "--repo", "JiusiServe/InferMatrixCopilot", "--pr", "84", "--publish",
+                   "--head", head])
+    assert rc == cli.EXIT_FAIL
+    checks = [w for w in fake.writes if w[:2] == ["api", "repos/JiusiServe/InferMatrixCopilot/check-runs"]]
+    assert len(checks) == 2, "one in_progress run first, then the completed one"
 
 
 def test_publish_failure_crashes_the_job_instead_of_looking_like_a_failed_bar(fake, capsys):
@@ -241,18 +254,21 @@ class VerifyingGh(RollbackGh):
         return super().write(args, stdin)
 
 
-def test_recovery_persists_the_label_before_closing_the_incident(monkeypatch, tmp_path, capsys):
+def test_recovery_labels_but_never_closes_the_incident(monkeypatch, tmp_path, capsys):
     gh = VerifyingGh()
     assert _tick_with(monkeypatch, tmp_path, gh) == cli.EXIT_OK
     order = [tuple(w[:3]) for w in gh.writes]
     label_at = next(i for i, w in enumerate(gh.writes) if "--add-label" in w and "rollback:recovered" in w)
-    close_incident_at = next(i for i, w in enumerate(gh.writes) if w[:3] == ["issue", "close", "50"])
     close_canary_at = next(i for i, w in enumerate(gh.writes) if w[:3] == ["issue", "close", "40"])
-    assert close_canary_at < label_at < close_incident_at, order
-    # if the label write fails, the incident is NOT closed and the next tick retries from verifying
+    assert close_canary_at < label_at, order
+    # automation never closes an incident: only a human may (and a bot close is reopened)
+    assert not any(w[:3] == ["issue", "close", "50"] for w in gh.writes)
+    assert any(w[:3] == ["issue", "comment", "50"] and "only a human may close" in (w[-1] if isinstance(w[-1], str) else "")
+               or (w[:3] == ["issue", "comment", "50"]) for w in gh.writes)
+    # if the label write fails, nothing terminal is recorded and the next tick retries from verifying
     failing = VerifyingGh(fail_on=lambda a: "--add-label" in a and "rollback:recovered" in a)
     assert _tick_with(monkeypatch, tmp_path, failing) == cli.EXIT_CRASH
-    assert not any(w[:3] == ["issue", "close", "50"] for w in failing.writes)
+    assert not any("rollback:recovered" in w and "--add-label" in w for w in failing.writes[:-1])
 
 
 def test_terminal_state_is_reconciled_on_later_ticks(monkeypatch, tmp_path, capsys):
@@ -260,7 +276,7 @@ def test_terminal_state_is_reconciled_on_later_ticks(monkeypatch, tmp_path, caps
     rc = _tick_with(monkeypatch, tmp_path, gh)
     assert rc == cli.EXIT_OK
     closes = [w for w in gh.writes if w[:2] == ["issue", "close"]]
-    assert {w[2] for w in closes} == {"40", "50"}, "original canary and incident are closed even though the label already says recovered"
+    assert {w[2] for w in closes} == {"40"}, "the original canary is closed even though the label already says recovered; the incident is left for a human"
     # and a failing close is retried next tick because nothing else changes
     gh2 = RecoveredGh(fail_close=True)
     assert _tick_with(monkeypatch, tmp_path, gh2) == cli.EXIT_CRASH
@@ -292,54 +308,80 @@ def test_failed_rollback_files_one_blocked_issue(monkeypatch, tmp_path, capsys):
 
 
 class PushGh(FakeGh):
-    """RB main gained one direct push; a canary record claims a human pushed it."""
+    """RB main received pushes; the deploy workflow's push runs are the immutable record."""
 
     OLD = "1" * 40
     NEW = "2" * 40
 
-    def __init__(self, run_actor: str, record_pusher: str = "tzhouam", run_event: str = "push"):
+    def __init__(self, run_actor: str, compare_status: str = "identical", merged_by: str = "tzhouam"):
         super().__init__()
-        from omni_maintainer.monitor.canary import CanaryRecord
-        self.run_actor, self.run_event = run_actor, run_event
-        self.record = CanaryRecord(repo="JiusiServe/omni-reviewbot", merge_sha=self.NEW, pre_merge_sha=self.OLD,
-                                   pr_number=None, deploy_run_id=901, opened_at="2026-09-03T00:00:00+00:00",
-                                   pusher=record_pusher)
+        from datetime import datetime, timezone
+        self.run_actor, self.compare_status, self.merged_by = run_actor, compare_status, merged_by
+        now = datetime.now(timezone.utc).isoformat()
+        self.runs = [{"id": 901, "head_sha": self.NEW, "event": "push", "created_at": now,
+                      "actor": {"login": run_actor}},
+                     {"id": 900, "head_sha": self.OLD, "event": "push", "created_at": now,
+                      "actor": {"login": "whoever"}}]
+        self.closed_incidents = []
 
     def api(self, path, *, method="GET", fields=None, paginate=False, raw_fields=None):
-        if path.startswith("repos/JiusiServe/omni-reviewbot/commits?sha=main"):
-            return [{"sha": self.NEW, "parents": [{"sha": self.OLD}], "commit": {"message": "hotfix by hand"}},
-                    {"sha": self.OLD, "parents": [{"sha": "0" * 40}], "commit": {"message": "Merge pull request #1 from x/y"}}]
-        if "issues?labels=maintainer:canary&state=all" in path:
-            return [{"number": 70, "body": self.record.to_marker(), "labels": [{"name": "maintainer:canary"}]}]
-        if path.endswith("/actions/runs/901"):
-            return {"event": self.run_event, "head_sha": self.NEW, "actor": {"login": self.run_actor}}
-        if "issues?labels=maintainer:canary&state=open" in path or "issues?labels=maintainer:incident" in path:
+        if "/actions/workflows/deploy.yml/runs" in path:
+            return {"workflow_runs": self.runs}
+        if path.endswith(f"/commits/{self.NEW}"):
+            return {"sha": self.NEW, "parents": [{"sha": self.OLD}], "commit": {"message": "hotfix by hand"}}
+        if path.endswith(f"/commits/{self.OLD}"):
+            return {"sha": self.OLD, "parents": [{"sha": "0" * 40}, {"sha": "9" * 40}],
+                    "commit": {"message": "Merge pull request #1 from x/y"}}
+        if path.endswith("/pulls/1"):
+            return {"merged": True, "base": {"ref": "main"}, "merge_commit_sha": self.OLD,
+                    "merged_by": {"login": self.merged_by}}
+        if "/compare/main..." in path:
+            return {"status": self.compare_status}
+        if "issues?labels=maintainer:incident&state=closed" in path:
+            return self.closed_incidents
+        if "issues?labels=maintainer:canary&state=open" in path or "issues?labels=maintainer:incident&state=open" in path:
             return []
+        if re.search(r"/issues/\d+/events", path):
+            return [{"event": "closed", "actor": {"login": "claude[bot]"}}]
         return super().api(path, method=method, fields=fields, paginate=paginate, raw_fields=raw_fields)
 
 
 def _push_tick(monkeypatch, tmp_path, gh):
     state = tmp_path / "s.json"
-    state.write_text(json.dumps({"cursors": {"rb_main_sha": PushGh.OLD}}))
+    # a tampered cursor pointing past the newest push must not hide it
+    state.write_text(json.dumps({"cursors": {"rb_main_sha": PushGh.NEW}}))
     monkeypatch.setattr(cli, "Gh", lambda: gh)
     monkeypatch.setattr(cli, "_fetch_digests", lambda policy, now: {})
     monkeypatch.setenv("MAINT_DRY_RUN", "1")
-    return cli.main(["monitor", "tick", "--state-file", str(state)])
+    return cli.main(["monitor", "tick", "--apply", "--state-file", str(state)])
 
 
-def test_direct_push_attribution_uses_run_metadata_not_the_record(monkeypatch, tmp_path, capsys):
-    # the record says tzhouam pushed, but the immutable run says someone else did: incident
+def test_pushes_come_from_immutable_run_metadata_not_cursors(monkeypatch, tmp_path, capsys):
+    # a direct push by an unknown actor is an incident, whatever any ledger cursor says
     assert _push_tick(monkeypatch, tmp_path, PushGh(run_actor="someone")) == cli.EXIT_OK
-    [push] = json.loads(capsys.readouterr().out)["pushes"]
-    assert push["kind"] == "direct_push_unattributed" and push["incident"]
-    # record and run agree on an allowlisted human: noted, not an incident
+    by_sha = {p["sha"]: p for p in json.loads(capsys.readouterr().out)["pushes"]}
+    assert by_sha[PushGh.NEW]["kind"] == "direct_push_unattributed" and by_sha[PushGh.NEW]["incident"]
+    assert by_sha[PushGh.OLD]["kind"] == "pr_merge" and not by_sha[PushGh.OLD]["incident"]
+    # the same push by an allowlisted human (server-stamped actor): noted, not an incident
     assert _push_tick(monkeypatch, tmp_path, PushGh(run_actor="tzhouam")) == cli.EXIT_OK
-    [push] = json.loads(capsys.readouterr().out)["pushes"]
-    assert push["kind"] == "direct_push_human" and not push["incident"] and push["pusher"] == "tzhouam"
-    # a run that is not a push event proves nothing
-    assert _push_tick(monkeypatch, tmp_path, PushGh(run_actor="tzhouam", run_event="workflow_dispatch")) == cli.EXIT_OK
-    [push] = json.loads(capsys.readouterr().out)["pushes"]
-    assert push["incident"]
+    by_sha = {p["sha"]: p for p in json.loads(capsys.readouterr().out)["pushes"]}
+    assert by_sha[PushGh.NEW]["kind"] == "direct_push_human" and not by_sha[PushGh.NEW]["incident"]
+    # a PR merge performed by an app rather than a human is an incident on Tier B
+    assert _push_tick(monkeypatch, tmp_path, PushGh(run_actor="tzhouam", merged_by="some-app[bot]")) == cli.EXIT_OK
+    by_sha = {p["sha"]: p for p in json.loads(capsys.readouterr().out)["pushes"]}
+    assert by_sha[PushGh.OLD]["kind"] == "pr_merge_unattributed" and by_sha[PushGh.OLD]["incident"]
+    # a pushed commit no longer reachable from main means history was rewritten
+    assert _push_tick(monkeypatch, tmp_path, PushGh(run_actor="tzhouam", compare_status="diverged")) == cli.EXIT_OK
+    assert all(p["kind"] == "history_rewritten" and p["incident"] for p in json.loads(capsys.readouterr().out)["pushes"])
+
+
+def test_incidents_closed_by_non_humans_are_reopened(monkeypatch, tmp_path, capsys):
+    gh = PushGh(run_actor="tzhouam")
+    gh.closed_incidents = [{"number": 88, "title": "[incident] x", "labels": [{"name": "maintainer:incident"}]}]
+    assert _push_tick(monkeypatch, tmp_path, gh) == cli.EXIT_OK
+    out = json.loads(capsys.readouterr().out)
+    assert out["reopened"] == [{"incident": 88, "closed_by": "claude[bot]"}]
+    assert any(w[:3] == ["issue", "reopen", "88"] for w in gh.writes)
 
 
 def test_issue_upsert_is_a_dry_run_until_issues_live(fake, tmp_path, capsys, monkeypatch):

@@ -12,7 +12,7 @@ import json
 import re
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -32,7 +32,7 @@ from .monitor.fingerprint import classify, excerpt, fingerprint
 from .monitor.issues import (UnsafeText, add_labels, close_issue, comment_issue, create_issue,
                              ensure_safe, find_issue_by_marker, fingerprint_marker, remove_labels,
                              render_failure_body)
-from .monitor.pushes import HISTORY_REWRITTEN, INCIDENT_KINDS, classify_commit, new_commits_since
+from .monitor.pushes import HISTORY_REWRITTEN, INCIDENT_KINDS, classify_commit
 from .routine.ghcli import Gh, GhError, git
 from .routine.ledger import parse_cursors, render_ledger, replace_cursors
 from .routine.preflight import Preflight, PreflightError, run_preflight
@@ -119,14 +119,26 @@ def _revert_facts(gh: Gh, policy: dict[str, Any], snapshot: PullSnapshot, workdi
     empty = git(["diff", "--stat", pre_merge, snapshot.head_sha], cwd=workdir).strip() == ""
     tip_is_deployed_merge = True
     if repo_cfg is not None and repo_cfg.deploys:
-        try:
-            runs = gh.api(f"repos/{snapshot.repo}/actions/workflows/{repo_cfg.deploy_workflow}/runs"
-                          f"?branch=main&event=push&status=success&per_page=20")
-        except GhError:
-            runs = {}
-        tip_is_deployed_merge = any(str(r.get("head_sha") or "").lower() == tip.lower()
-                                    for r in (runs or {}).get("workflow_runs", []))
+        # A successful run is not a successful deployment: with the deploy
+        # disabled the deploy-production job is skipped and the run still
+        # succeeds. Require that job's own success for the tip.
+        tip_is_deployed_merge = _deployed_successfully(gh, snapshot.repo, repo_cfg.deploy_workflow, tip)
     return empty, tip_is_deployed_merge
+
+
+def _deployed_successfully(gh: Gh, repo: str, workflow_file: str, sha: str) -> bool:
+    """Did a push run of ``workflow_file`` for ``sha`` complete its deploy-production job successfully?"""
+    try:
+        runs = gh.api(f"repos/{repo}/actions/workflows/{workflow_file}/runs?branch=main&event=push&per_page=30")
+    except GhError:
+        return False
+    for run in (runs or {}).get("workflow_runs", []):
+        if str(run.get("head_sha") or "").lower() != sha.lower():
+            continue
+        _, conclusion, _ = _deploy_run_details(gh, repo, int(run.get("id") or 0))
+        if conclusion == "success":
+            return True
+    return False
 
 
 def _bar_inputs(gh: Gh, policy: dict[str, Any], snapshot: PullSnapshot, workdir: str | None) -> tuple[BarInputs, Preflight]:
@@ -139,6 +151,14 @@ def _bar_inputs(gh: Gh, policy: dict[str, Any], snapshot: PullSnapshot, workdir:
 
 def cmd_gate_evaluate(args: argparse.Namespace, policy: dict[str, Any], gh: Gh) -> int:
     repo = repo_config(policy, args.repo)
+    if args.publish and getattr(args, "head", ""):
+        # Pending first: from here on the newest check on the head is never a
+        # stale success, whatever happens below.
+        try:
+            gate_merge.publish_pending(gh, repo=args.repo, head_sha=args.head, details_url=args.details_url or "")
+        except GhError as exc:
+            _emit({"ok": False, "publish_error": str(exc), "summary": "could not publish the pending check"})
+            return EXIT_CRASH
     try:
         snapshot = _load_pull(gh, policy, args.repo, args.pr)
         inputs, _ = _bar_inputs(gh, policy, snapshot, args.workdir)
@@ -269,13 +289,22 @@ def _deploy_run(gh: Gh, repo: str, run_id: int | None) -> tuple[str, str | None]
 
 
 def _deploy_run_details(gh: Gh, repo: str, run_id: int | None) -> tuple[str, str | None, datetime | None]:
-    """(status, conclusion of the deploy-production job, its server-stamped completion time)."""
+    status, conclusion, completed_at, _ = _deploy_job_facts(gh, repo, run_id)
+    return status, conclusion, completed_at
+
+
+def _deploy_job_facts(gh: Gh, repo: str, run_id: int | None) -> tuple[str, str | None, datetime | None, datetime | None]:
+    """(status, conclusion, completed_at, started_at) of the deploy-production job of ``run_id``.
+
+    Only that job counts as a deployment: a run can complete successfully
+    with the job skipped (deployment disabled), which is no deployment.
+    """
     if not run_id:
-        return "unknown", None, None
+        return "unknown", None, None, None
     try:
         run = gh.api(f"repos/{repo}/actions/runs/{run_id}")
     except GhError:
-        return "unknown", None, None
+        return "unknown", None, None, None
     status = str(run.get("status") or "unknown")
     conclusion = run.get("conclusion")
     completed_at = parse_time(run.get("updated_at"))
@@ -284,10 +313,12 @@ def _deploy_run_details(gh: Gh, repo: str, run_id: int | None) -> tuple[str, str
             jobs = gh.api(f"repos/{repo}/actions/runs/{run_id}/jobs?per_page=100")
             for job in (jobs or {}).get("jobs", []):
                 if job.get("name") == "deploy-production":
-                    return "completed", job.get("conclusion"), parse_time(job.get("completed_at")) or completed_at
+                    return ("completed", job.get("conclusion"), parse_time(job.get("completed_at")) or completed_at,
+                            parse_time(job.get("started_at")))
         except GhError:
-            pass
-    return status, conclusion, completed_at
+            return "completed", None, completed_at, None
+        return "completed", None, completed_at, None
+    return status, conclusion, completed_at, None
 
 
 def _read_cursors(gh: Gh, policy: dict[str, Any], state_file: str | None) -> tuple[dict[str, Any], str]:
@@ -414,29 +445,23 @@ def cmd_monitor_tick(args: argparse.Namespace, policy: dict[str, Any], gh: Gh) -
         elif d.ok:
             decisions["pending_acks"].append({"instance": name, "failures": len([f for f in decisions["failures"] if f["instance"] == name])})
 
-    # Direct pushes on the reviewbot main branch.
+    # Pushes to the reviewbot main branch, reconstructed from immutable
+    # Actions data every tick: every push to main starts a push run of the
+    # deploy workflow, whose head_sha and actor GitHub stamps. No cursor a
+    # routine could advance is consulted, so a routine-editable ledger
+    # marker cannot hide a push. Each run is classified afresh; incidents
+    # are de-duplicated by the run id marker in their body.
     rb = policy["ledger"]["repo"]
     labels = policy["labels"]
+    rb_cfg = repo_config(policy, rb)
+    since = now - timedelta(hours=float(m.get("push_lookback_hours", 48)))
     try:
-        commits = gh.api(f"repos/{rb}/commits?sha=main&per_page=50")
+        runs = (gh.api(f"repos/{rb}/actions/workflows/{rb_cfg.deploy_workflow}/runs?branch=main&event=push&per_page=100")
+                or {}).get("workflow_runs", [])
     except GhError as exc:
-        decisions["signals"].append({"signal": "commits_unreadable", "error": str(exc)})
-        commits = []
-    last_seen = str(cursors.get("rb_main_sha") or "")
-    fresh, found = new_commits_since(commits or [], last_seen_sha=last_seen) if last_seen else ([], True)
-    if last_seen and commits and not found:
-        # The commit we last saw on main is gone from its recent history:
-        # a non-fast-forward update or more than a page of pushes. Both are
-        # incidents until a human looks; an old merge commit could have been
-        # re-pointed to look like an ordinary merge.
-        decisions["pushes"].append({"sha": str(commits[0].get("sha") or ""), "kind": HISTORY_REWRITTEN,
-                                    "pr": None, "pusher": "", "message": f"last seen {last_seen[:8]} not reachable",
-                                    "incident": True, "ack": f"--rb-main-sha {commits[0].get('sha')}"})
-        fresh = []
-    # Server-stamped pushers, verified against immutable Actions run metadata.
-    # The canary record only points at the deploy run; issue bodies are
-    # editable, so the ``pusher`` written there is never trusted by itself.
-    pushers: dict[str, str] = _verified_pushers(gh, rb, labels["canary"]) if fresh else {}
+        decisions["signals"].append({"signal": "push_runs_unreadable", "error": str(exc)})
+        runs = []
+
     def merged_pr_sha(number: int) -> tuple[str, str] | None:
         """GitHub's record: merged into main, its merge commit sha and who merged it."""
         try:
@@ -447,21 +472,31 @@ def cmd_monitor_tick(args: argparse.Namespace, policy: dict[str, Any], gh: Gh) -
             return None
         return (str(pull.get("merge_commit_sha") or ""), str((pull.get("merged_by") or {}).get("login") or ""))
 
-    incident_pushes = sum(1 for p in decisions["pushes"] if p.get("incident"))
-    for commit in fresh:
-        cls = classify_commit(commit, merged_pr_sha=merged_pr_sha, pushers=pushers,
-                              humans=policy["identities"].get("humans") or ())
-        is_incident = cls.kind in INCIDENT_KINDS
-        incident_pushes += int(is_incident)
-        decisions["pushes"].append({"sha": cls.sha, "kind": cls.kind, "pr": cls.pr_number, "pusher": cls.pusher,
-                                    "message": cls.message, "incident": is_incident,
-                                    "ack": f"--rb-main-sha {cls.sha}" if is_incident else ""})
-    # Same rule as job cursors: the main-branch cursor advances past an
-    # incident-class push only once its incident issue exists (`monitor ack`).
-    if commits and not incident_pushes:
-        cursors["rb_main_sha"] = str(commits[0].get("sha") or last_seen)
-    elif commits:
-        decisions["pending_acks"].append({"rb_main_sha": str(commits[0].get("sha") or "")})
+    humans = policy["identities"].get("humans") or ()
+    for run in runs:
+        created = parse_time(run.get("created_at"))
+        if created is None or created < since:
+            continue
+        sha = str(run.get("head_sha") or "").lower()
+        actor = str((run.get("actor") or {}).get("login") or "")
+        try:
+            commit = gh.api(f"repos/{rb}/commits/{sha}")
+        except GhError:
+            commit = {"sha": sha, "commit": {"message": ""}, "parents": []}
+        cls = classify_commit(commit, merged_pr_sha=merged_pr_sha, pushers={sha: actor}, humans=humans)
+        kind = cls.kind
+        # A pushed commit no longer reachable from main means history was
+        # rewritten afterwards: an incident until a human confirms.
+        try:
+            compare = gh.api(f"repos/{rb}/compare/main...{sha}")
+            if str(compare.get("status") or "") in ("ahead", "diverged"):
+                kind = HISTORY_REWRITTEN
+        except GhError:
+            pass
+        is_incident = kind in INCIDENT_KINDS
+        decisions["pushes"].append({"sha": sha, "run_id": run.get("id"), "kind": kind, "pr": cls.pr_number,
+                                    "pusher": actor, "message": cls.message, "incident": is_incident,
+                                    "marker": f"<!-- omni-maintainer:push-run:{run.get('id')} -->"})
 
     # Canaries.
     canaries = gh.api(f"repos/{rb}/issues?labels={labels['canary']}&state=open&per_page=100", paginate=True)
@@ -487,7 +522,7 @@ def cmd_monitor_tick(args: argparse.Namespace, policy: dict[str, Any], gh: Gh) -
         if not trusted:
             decisions["notes"].append("identities.routine_login is unset: no prior tick is trusted "
                                       "(set it after the probe)")
-        status, conclusion, deployed_at = _deploy_run_details(gh, rb, record.deploy_run_id)
+        status, conclusion, deployed_at, deploy_started_at = _deploy_job_facts(gh, rb, record.deploy_run_id)
         if record.baseline is not None and record.baseline.started_at:
             new_jobs, failed_jobs = canary_mod.jobs_since(record.baseline, digests)
         else:
@@ -502,12 +537,15 @@ def cmd_monitor_tick(args: argparse.Namespace, policy: dict[str, Any], gh: Gh) -
         decisions["canaries"].append(entry)
         if args.apply:
             _apply_canary(gh, policy, rb, int(issue["number"]), record, tick, decision, digests, now,
-                          deployed_at=deployed_at)
+                          deployed_at=deployed_at, deploy_started_at=deploy_started_at)
 
     # Rollbacks: advance every open incident through its state machine so a
     # tripped canary does not stay open forever and block the next deploy.
     _advance_rollbacks(gh, policy, rb, now=now, apply=args.apply, trusted=_tick_authors(policy),
                        decisions=decisions)
+    # Incidents may only be cleared by a human: one closed by anyone else
+    # (a routine, an app) is reopened, with the close attributed.
+    _reopen_incidents_closed_by_non_humans(gh, policy, rb, since=since, apply=args.apply, decisions=decisions)
 
     if args.apply or args.state_file:
         _write_cursors(gh, policy, args.state_file, cursors, ledger_body, now)
@@ -517,16 +555,24 @@ def cmd_monitor_tick(args: argparse.Namespace, policy: dict[str, Any], gh: Gh) -
 
 def _apply_canary(gh: Gh, policy: dict[str, Any], repo: str, number: int, record: canary_mod.CanaryRecord,
                   tick: canary_mod.Tick, decision: canary_mod.Decision, digests: dict[str, Digest], now: datetime,
-                  *, deployed_at: datetime | None = None) -> None:
+                  *, deployed_at: datetime | None = None, deploy_started_at: datetime | None = None) -> None:
     labels = policy["labels"]
     comment_issue(gh, repo=repo, number=number,
                   body=f"tick {now.replace(microsecond=0).isoformat()}: **{decision.action}** — {decision.reason}\n\n{tick.to_marker()}")
     if decision.action == canary_mod.START:
         # The baseline is the one the deploy job captured before deploying
-        # (evaluate() holds without it). The window starts at the deploy
-        # job's server-stamped completion time, not when this tick happened
-        # to observe it.
-        record.baseline = canary_mod.open_window(record.baseline, started_at=deployed_at or now)
+        # (evaluate() holds without it); the deploy-production job's own
+        # pre-deploy comment (workflow identity only) refines counters and
+        # cursors to seconds before the deploy. The window starts at the
+        # deploy job's server-stamped completion time, not when this tick
+        # happened to observe it.
+        pre_deploy = None
+        workflow_login = str(policy["identities"].get("workflow_login") or "github-actions[bot]")
+        for c in gh.api(f"repos/{repo}/issues/{number}/comments?per_page=100", paginate=True) or []:
+            if str((c.get("user") or {}).get("login") or "") == workflow_login:
+                pre_deploy = canary_mod.PreDeploy.parse(str(c.get("body") or "")) or pre_deploy
+        record.baseline = canary_mod.open_window(record.baseline, started_at=deployed_at or now, pre_deploy=pre_deploy,
+                                                 attribute_from=deploy_started_at or deployed_at or now)
         record.status = "running"
         _rewrite_canary_body(gh, repo, number, record)
     elif decision.action == canary_mod.CLOSE:
@@ -664,6 +710,39 @@ def _advance_rollbacks(gh: Gh, policy: dict[str, Any], repo: str, *, now: dateti
             _after_terminal_label(gh, repo, incident, transition.state)
 
 
+def _reopen_incidents_closed_by_non_humans(gh: Gh, policy: dict[str, Any], repo: str, *, since: datetime,
+                                           apply: bool, decisions: dict[str, Any]) -> None:
+    """Holds are cleared only with human provenance (issue events are immutable)."""
+    labels = policy["labels"]
+    humans = set(policy["identities"].get("humans") or ())
+    try:
+        closed = gh.api(f"repos/{repo}/issues?labels={labels['incident']}&state=closed&since={since.isoformat()}"
+                        f"&per_page=100", paginate=True) or []
+    except GhError as exc:
+        decisions["signals"].append({"signal": "closed_incidents_unreadable", "error": str(exc)})
+        return
+    for issue in closed:
+        if "pull_request" in issue:
+            continue
+        number = int(issue["number"])
+        try:
+            events = gh.api(f"repos/{repo}/issues/{number}/events?per_page=100", paginate=True) or []
+        except GhError:
+            continue
+        closer = ""
+        for event in events:
+            if str(event.get("event") or "") == "closed":
+                closer = str((event.get("actor") or {}).get("login") or "")
+        if closer in humans:
+            continue
+        decisions.setdefault("reopened", []).append({"incident": number, "closed_by": closer or "unknown"})
+        if apply:
+            gh.write(["issue", "reopen", str(number), "-R", repo])
+            comment_issue(gh, repo=repo, number=number,
+                          body=f"reopened: this incident was closed by `{closer or 'unknown'}`, and only a human "
+                               f"listed in the policy may clear a deploy hold.")
+
+
 def _issue_is_open(gh: Gh, repo: str, number: int) -> bool:
     return str(gh.api(f"repos/{repo}/issues/{number}").get("state") or "") == "open"
 
@@ -694,12 +773,19 @@ def _before_terminal_label(gh: Gh, repo: str, incident: dict[str, Any], state: s
 
 
 def _after_terminal_label(gh: Gh, repo: str, incident: dict[str, Any], state: str) -> None:
-    """The one side effect that must come AFTER the terminal label: closing a
-    recovered incident. Closing first would hide it from the open-incident
-    scan before its state was persisted."""
+    """After the terminal label: nothing closes the incident.
+
+    Automation never closes an incident: only a human clears one, and an
+    incident closed by anyone else is reopened on the next tick. A
+    recovered incident stops holding deploys through its
+    ``rollback:recovered`` label instead, and the ledger lists it under
+    "waiting for you" until a human closes it.
+    """
     number = int(incident["number"])
     if state == rollback_mod.RECOVERED and _issue_is_open(gh, repo, number):
-        close_issue(gh, repo=repo, number=number, comment="production verified healthy after the rollback")
+        comment_issue(gh, repo=repo, number=number,
+                      body="production verified healthy after the rollback. This incident still holds deploys "
+                           "until a human closes it (labels never lift a hold); please review and close.")
 
 
 def _rewrite_canary_body(gh: Gh, repo: str, number: int, record: canary_mod.CanaryRecord) -> None:
@@ -724,8 +810,6 @@ def cmd_monitor_ack(args: argparse.Namespace, policy: dict[str, Any], gh: Gh) ->
     cursors, ledger_body = _read_cursors(gh, policy, args.state_file)
     if args.instance and args.updated_at:
         _advance_watermark(cursors, args.instance, args.updated_at)
-    if args.rb_main_sha:
-        cursors["rb_main_sha"] = args.rb_main_sha
     _write_cursors(gh, policy, args.state_file, cursors, ledger_body, now)
     _emit({"ok": True, "cursors": cursors})
     return EXIT_OK
@@ -813,6 +897,11 @@ def cmd_ledger_render(args: argparse.Namespace, policy: dict[str, Any], gh: Gh) 
     for pull in gh.api(f"repos/{rb}/pulls?state=open&per_page=100", paginate=True) or []:
         if any(l.get("name") == policy["labels"]["merge_requested"] for l in pull.get("labels") or []):
             waiting.append({"repo": rb, "number": pull["number"], "title": pull.get("title"), "why": "ready to merge"})
+    for issue in pre.open_incidents:
+        names = {str(l.get("name")) for l in issue.get("labels") or []}
+        if rollback_mod.RECOVERED in names:
+            waiting.append({"repo": rb, "number": issue["number"], "title": issue.get("title"),
+                            "why": "recovered; still a deploy hold until a human closes it"})
     actions = list(json.loads(Path(args.actions_file).read_text()) if args.actions_file and Path(args.actions_file).exists() else [])
     cursors = {}
     if pre.ledger_issue:
@@ -916,7 +1005,6 @@ def build_parser() -> argparse.ArgumentParser:
     ack = mon.add_parser("ack", help="advance a cursor after its issue exists")
     ack.add_argument("--instance")
     ack.add_argument("--updated-at", help="the acknowledged job's updated_at (from monitor tick)")
-    ack.add_argument("--rb-main-sha")
     ack.add_argument("--state-file", default=None)
     ack.set_defaults(func=cmd_monitor_ack)
 

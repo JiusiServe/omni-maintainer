@@ -76,11 +76,9 @@ def classify_commit(commit: dict[str, Any], *, merged_pr_sha: MergeLookup,
 def new_commits_since(commits: list[dict[str, Any]], *, last_seen_sha: str) -> tuple[list[dict[str, Any]], bool]:
     """(commits newer than ``last_seen_sha``, oldest first; whether it was found).
 
-    ``commits`` is GitHub's newest-first listing of ``main``. When the last
-    seen sha is absent, either more than a page landed since the last tick
-    or history was rewritten (a non-fast-forward update); the caller treats
-    both as ``history_rewritten`` until a human confirms, because a rewrite
-    can reuse an old merge commit to look like an ordinary merge.
+    Kept for local analysis. The monitor itself does not walk ``main`` from
+    a stored cursor: it reconstructs pushes from the deploy workflow's push
+    runs (immutable), so no routine-editable state can hide one.
     """
     out: list[dict[str, Any]] = []
     found = False

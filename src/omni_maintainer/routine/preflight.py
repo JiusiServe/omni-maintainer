@@ -35,6 +35,8 @@ class Preflight:
 
     @property
     def deploy_hold(self) -> bool:
+        """Any open incident or rollback item holds deploys until a human
+        closes it; no label lifts a hold, because labels are routine-editable."""
         return bool(self.open_incidents or self.open_rollbacks)
 
     @property

@@ -166,29 +166,62 @@ def test_canary_lifecycle_start_trip_close(policy):
                            now=NOW, policy=policy).action == canary.START
     opened = canary.open_window(pre, started_at=NOW)
     assert opened.started_at == NOW.isoformat() and opened.max_job_ids == pre.max_job_ids
+    # the deploy job's own pre-deploy comment (seconds before deploying) supplies cursors and counters:
+    # jobs and failures from the queue/approval gap belong to the previous release...
+    busy = {name: replace(d, max_job_id=d.max_job_id + 50,
+                          jobs=tuple(d.jobs) + ({"id": d.max_job_id + 50, "kind": "triage", "status": "triaged",
+                                                 "updated_at": NOW.strftime("%Y-%m-%dT%H:%M:%SZ")},))
+            for name, d in digests.items()}
+    gap_capture = canary.PreDeploy.parse(
+        "<!-- omni-maintainer:predeploy:v1 " + json.dumps({
+            "captured_at": (NOW - timedelta(minutes=1)).isoformat(),
+            "counts_failed": {n: d.counts.get("failed", 0) + 4 for n, d in digests.items()},
+            "max_job_ids": {n: d.max_job_id + 50 for n, d in digests.items()}}, sort_keys=True) + " -->")
+    opened_gap = canary.open_window(pre, started_at=NOW, pre_deploy=gap_capture)
+    assert all(opened_gap.max_job_ids[n] == pre.max_job_ids[n] + 50 for n in pre.max_job_ids)
+    assert opened_gap.counts_failed == pre.counts_failed + 4 * len(digests)
+    assert opened_gap.attribute_from == (NOW - timedelta(minutes=1)).isoformat()
+    assert canary.jobs_since(opened_gap, busy)[0] == 0 and canary.jobs_since(opened, busy)[0] == len(busy)
+    gap = {name: replace(d, counts={**d.counts, "failed": d.counts.get("failed", 0) + 4}) for name, d in digests.items()}
+    record.baseline = opened_gap
+    steady = view(canary.Tick(h1, _fresh(gap, h1), "completed", "success", 1, 0))
+    assert canary.evaluate(record, [steady], now=h1, policy=policy).action == canary.WAIT
+    # ...while without that comment the pre-queue reading stays in force and the gap is charged to
+    # this release (errs toward tripping, never toward passing); nothing is re-read at the first tick
+    record.baseline = canary.open_window(pre, started_at=NOW)
+    assert record.baseline.counts_failed == pre.counts_failed
+    assert canary.evaluate(record, [steady], now=h1, policy=policy).action == canary.TRIP
     # failures are attributed from the pre-deploy capture instant, not from the first post-deploy tick
-    captured = NOW - timedelta(hours=2)
-    early = canary.open_window(canary.baseline_from(digests, started_at=None, captured_at=captured), started_at=NOW)
-    assert early.captured_at == captured.isoformat() and early.failures_from == captured
+    captured = NOW - timedelta(hours=3)
+    deploy_started = NOW - timedelta(hours=2)
+    early = canary.open_window(canary.baseline_from(digests, started_at=None, captured_at=captured),
+                               started_at=NOW, attribute_from=deploy_started)
+    assert early.captured_at == captured.isoformat() and early.failures_from == deploy_started
     between = {name: replace(d, jobs=tuple(d.jobs) + (
         {"id": 999999, "kind": "review", "status": "failed", "error": "boom",
          "updated_at": (NOW - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")},)) for name, d in digests.items()}
     _, failed_between = canary.jobs_since(early, between)
-    _, failed_from_start = canary.jobs_since(replace(early, captured_at=NOW.isoformat()), between)
-    assert failed_between == len(between) and failed_from_start == 0
-    # a single new gate failure trips when the 14-day baseline mean is zero
+    _, failed_from_window = canary.jobs_since(replace(early, attribute_from=NOW.isoformat()), between)
+    assert failed_between == len(between) and failed_from_window == 0
+    # a failure between the pre-deploy capture and the deploy job's start belongs to the previous release
+    before_deploy = {name: replace(d, jobs=tuple(d.jobs) + (
+        {"id": 999998, "kind": "review", "status": "failed", "error": "old",
+         "updated_at": (captured + timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%SZ")},)) for name, d in digests.items()}
+    assert canary.jobs_since(early, before_deploy)[1] == 0
+    # the absolute failed-job counter (jobs table) is the only counter used: a rise above the
+    # threshold trips, a regression is invalid telemetry (hold), and review_stats are never consulted
     live = canary.baseline_from(digests, started_at=NOW)
-    record.baseline = replace(live, mean_gate_failures=0.0)
     same = view(canary.Tick(h1, _fresh(digests, h1), "completed", "success", 1, 0))
+    record.baseline = live
     assert canary.evaluate(record, [same], now=h1, policy=policy).action == canary.WAIT
-    record.baseline = replace(live, mean_gate_failures=0.0, gate_failures=live.gate_failures - 1)
+    record.baseline = replace(live, counts_failed=live.counts_failed - 3)
     d = canary.evaluate(record, [same], now=h1, policy=policy)
-    assert d.action == canary.TRIP and d.details["rule"] == "gate_failures"
-    # with a non-zero baseline mean, one more gate failure is tolerated, two trip
-    record.baseline = replace(live, gate_failures=live.gate_failures - 1)
+    assert d.action == canary.TRIP and d.details["rule"] == "counts_failed"
+    record.baseline = replace(live, counts_failed=live.counts_failed + 5)
+    d = canary.evaluate(record, [same], now=h1, policy=policy)
+    assert d.action == canary.HOLD and d.details["rule"] == "invalid_telemetry"
+    record.baseline = replace(live, gate_failures=0, review_failed=0, split_failed=0)  # ignored fields
     assert canary.evaluate(record, [same], now=h1, policy=policy).action == canary.WAIT
-    record.baseline = replace(live, gate_failures=live.gate_failures - 2)
-    assert canary.evaluate(record, [same], now=h1, policy=policy).action == canary.TRIP
 
 
 def test_canary_down_and_watcher_rules(policy):

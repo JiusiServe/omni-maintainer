@@ -15,7 +15,17 @@ Record the start time, then run each check and keep its result:
    so, `gh api /installation/repositories` or note the error), and the login
    that `gh api repos/JiusiServe/omni-maintainer/collaborators` reports for you
    if any.
-2. Reads: `gh repo view JiusiServe/omni-reviewbot --json name,isPrivate`,
+2. Token permissions (this decides what a compromised routine could do):
+   `gh api /installation/repositories` if it answers, and then probe each
+   dangerous write and record allowed/denied WITHOUT completing it:
+   `gh api -X POST repos/JiusiServe/omni-reviewbot/actions/runs/1/rerun`
+   (expect 403/404), `gh api -X DELETE repos/JiusiServe/omni-reviewbot/actions/runs/1`
+   (expect 403/404), `gh variable set PROBE_X --body 1 -R JiusiServe/omni-reviewbot`
+   (record; delete it if it succeeded), `gh workflow run deploy.yml -R JiusiServe/omni-reviewbot`
+   (expect denial; if it succeeds, cancel it immediately and record loudly).
+   The design assumes Actions runs and jobs are immutable to the routine;
+   any allowed write above must be reported as a blocker.
+   Reads: `gh repo view JiusiServe/omni-reviewbot --json name,isPrivate`,
    `gh repo view JiusiServe/InferMatrixCopilot --json name`,
    `gh variable list -R JiusiServe/omni-reviewbot` (note: allowed or denied),
    `gh api repos/JiusiServe/omni-reviewbot/environments/production`

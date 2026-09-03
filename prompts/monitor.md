@@ -58,16 +58,18 @@ contract; you start with no other context.
      watermark only after the issue exists, so a crash before this step
      re-surfaces the failure next hour instead of losing it. Until
      `phase.issues_live` is true the command runs as a dry run and says so.
-5. For each entry in `pushes` with `incident: true`: file one issue in
-   `JiusiServe/omni-reviewbot` labeled `maintainer:incident` titled
-   `[incident] direct push to main <sha8>` with the commit facts (sha,
-   author, message, whether a deploy run exists for it). An open incident is
-   a deploy hold by itself. Only a human can pause the system, so the
-   incident must ask a human to add `maintainer:paused` to the ledger and to
-   set `PRODUCTION_DEPLOY_ENABLED=false`; then run
-   `python -m omni_maintainer monitor ack --rb-main-sha <sha>` (only after the
-   incident exists) and stop this run after posting.
-   A `direct_push_human` entry is not an incident: mention it in the ledger.
+5. For each entry in `pushes` with `incident: true`: search open and closed
+   incidents for its `marker` (the push run id); if none exists, file one
+   issue in `JiusiServe/omni-reviewbot` labeled `maintainer:incident` titled
+   `[incident] <kind> on main <sha8>` with the facts from the entry (sha,
+   run id, pusher, message) and the `marker` verbatim in the body. Pushes
+   are reconstructed every hour from the deploy workflow's runs, so there is
+   nothing to acknowledge; the marker is what prevents duplicates. An open
+   incident is a deploy hold by itself. Only a human can pause the system,
+   so the incident must ask a human to add `maintainer:paused` to the ledger
+   and to set `PRODUCTION_DEPLOY_ENABLED=false`; stop this run after
+   posting. A `direct_push_human` or `pr_merge` entry is not an incident:
+   mention direct human pushes in the ledger.
    If `signals` contains `job_window_saturated`, say so in the ledger: more
    than 50 jobs updated since the last tick and older failures may be unseen.
 6. For each canary decision with action `trip`, `deploy_failed` or `hold`,

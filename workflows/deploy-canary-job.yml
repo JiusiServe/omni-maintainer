@@ -29,13 +29,74 @@
 #       request labeled maintainer:rollback into main, and
 #   (b) the pushed commit's TREE equals the tree that the currently live
 #       deployment replaced: the first parent of the head commit of the
-#       newest successful push run of this workflow on main (Actions run
-#       metadata, immutable). No issue, label or marker is consulted, and a
-#       match against some older deployment proves nothing.
-# Retry: once the open window closes, re-run the failed run from the Actions
-# UI ("Re-run failed jobs" keeps the push context; the first step still
-# requires main to be at this commit), or push again. A rerun is a new
-# deploy attempt with its own record (run id + run_attempt).
+#       newest push run of this workflow on main whose deploy-production
+#       JOB succeeded (a run can succeed with that job skipped). Actions
+#       metadata only; no issue, label or marker is consulted, and a match
+#       against some older deployment proves nothing.
+# Retry: once the open window closes, re-run the run from the Actions UI
+# with "Re-run ALL jobs" (keeps the push context), or push again. A rerun
+# is a new deploy attempt with its own record (run id + run_attempt);
+# "Re-run failed jobs" cannot create that record when the previous
+# attempt's canary-record job had succeeded, so deploy-production's guard
+# refuses it by design. Record identity is (run_id, run_attempt) only.
+#
+# deploy-production must ALSO begin with the two checks below (splice the
+# `deploy-guard` step in as its first step): "Re-run failed jobs" reruns a
+# failed deploy job without rerunning a canary-record job that succeeded
+# earlier, so the deploy job itself re-verifies, for its own run_attempt,
+# that main is still at this commit and that a canary record for exactly
+# (run_id, run_attempt) exists and was authored by the workflow identity.
+#
+#   deploy-production:
+#     permissions: { contents: read, issues: write, actions: read }
+#     steps:
+#       - name: deploy-guard (stale tip / hold provenance / record for this attempt / pre-deploy counters)
+#         env:
+#           GH_TOKEN: ${{ github.token }}
+#           MERGE_SHA: ${{ github.sha }}
+#           RUN_ID: ${{ github.run_id }}
+#           RUN_ATTEMPT: ${{ github.run_attempt }}
+#           HUMANS: "tzhouam"     # the policy's allowlisted humans, space separated
+#         run: |
+#           # Everything is re-read LIVE here, immediately before the deploy script runs, so the
+#           # canary-record job's earlier checks cannot go stale in between (TOCTOU):
+#           tip=$(gh api "repos/${GITHUB_REPOSITORY}/branches/main" -q .commit.sha)
+#           [ "$tip" = "$MERGE_SHA" ] || { echo "stale run: main is at $tip" >&2; exit 1; }
+#           enabled=$(gh variable get PRODUCTION_DEPLOY_ENABLED -R "${GITHUB_REPOSITORY}" 2>/dev/null || echo false)
+#           [ "$enabled" = "true" ] || { echo "PRODUCTION_DEPLOY_ENABLED is now '$enabled'; refusing to deploy" >&2; exit 1; }
+#           # Open canaries/incidents/rollbacks hold, with the same rollback exception as canary-record
+#           # (re-run that job's check here: an open item that appeared since must block).
+#           # Holds are cleared by HUMAN closes only. An incident closed within the last 30 days by
+#           # anyone else (a bot relabeling or closing it) still holds; labels are never trusted here.
+#           since=$(date -u -d '30 days ago' +%Y-%m-%dT%H:%M:%SZ)
+#           for n in $(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues?labels=maintainer:incident&state=closed&since=${since}&per_page=100" --jq '.[] | select(.pull_request == null) | .number'); do
+#             closer=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${n}/events?per_page=100" --jq '[.[] | select(.event=="closed")] | last | .actor.login')
+#             case " $HUMANS " in *" $closer "*) ;; *) echo "incident #$n was closed by '$closer', not a human: still a hold" >&2; exit 1;; esac
+#           done
+#           # the record is one JSON object with sorted keys on one line; both fields must be in the same body
+#           record=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues?labels=maintainer:canary&state=all&per_page=100" \
+#             --jq '.[] | select(.user.login == "github-actions[bot]") | "\(.number) \(.body)"' \
+#             | grep -E "\"deploy_run_id\": ${RUN_ID},.*\"run_attempt\": ${RUN_ATTEMPT}[,}]" | head -n1)
+#           [ -n "$record" ] || { echo "no canary record for run ${RUN_ID} attempt ${RUN_ATTEMPT}; refusing to deploy" >&2; exit 1; }
+#           number=${record%% *}
+#           # Pre-deploy counters, seconds before the deploy, posted as a workflow-authored comment the
+#           # monitor trusts: failures from this instant on are the new release's; nothing from the
+#           # queue/approval gap is, and nothing between the deploy and the first tick is lost.
+#           python3 - "$number" <<'PY'
+#           import json, subprocess, sys, urllib.request
+#           from datetime import datetime, timezone
+#           number = sys.argv[1]; readings = {}
+#           for name, base in (("vllm_omni", "http://review.43.155.186.30.nip.io/code_review/vllm_omni"),
+#                              ("vllm_gr", "http://review.43.155.186.30.nip.io/code_review/vllm_gr")):
+#               with urllib.request.urlopen(base + "/api/status", timeout=90) as r:
+#                   readings[name] = json.loads(r.read().decode("utf-8"))
+#           pre = {"captured_at": datetime.now(timezone.utc).isoformat(),
+#                  "counts_failed": {n: int((r.get("counts") or {}).get("failed") or 0) for n, r in readings.items()},
+#                  "max_job_ids": {n: max((int(j.get("id") or 0) for j in r.get("jobs") or []), default=0) for n, r in readings.items()}}
+#           body = "pre-deploy counters captured by the deploy job\n\n<!-- omni-maintainer:predeploy:v1 " + json.dumps(pre, sort_keys=True) + " -->"
+#           subprocess.run(["gh", "api", f"repos/{__import__('os').environ['GITHUB_REPOSITORY']}/issues/{number}/comments", "-X", "POST", "-f", f"body={body}"], check=True)
+#           PY
+#       - ... the existing deploy steps ...
 jobs:
   canary-record:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.PRODUCTION_DEPLOY_ENABLED == 'true'
@@ -71,9 +132,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           MERGE_SHA: ${{ github.sha }}
           HEAD_MESSAGE: ${{ github.event.head_commit.message }}
+          HUMANS: "tzhouam"   # the policy's allowlisted humans, space separated
         run: |
           python3 - <<'PY'
           import json, os, re, subprocess, sys
+          from datetime import datetime, timedelta, timezone
           repo = os.environ["GITHUB_REPOSITORY"]
           merge_sha = os.environ["MERGE_SHA"]
           message = os.environ.get("HEAD_MESSAGE") or ""
@@ -82,8 +145,9 @@ jobs:
               return subprocess.run(["gh", *args], text=True, capture_output=True, check=True).stdout
 
           def issues(label, state="open"):
+              since = "&since=" + (datetime.now(timezone.utc) - timedelta(days=30)).isoformat() if state == "closed" else ""
               pages = json.loads(gh("api", "--paginate", "--slurp",
-                                    f"repos/{repo}/issues?labels={label}&state={state}&per_page=100"))
+                                    f"repos/{repo}/issues?labels={label}&state={state}{since}&per_page=100"))
               return [i for page in pages for i in page if "pull_request" not in i]
 
           # Is this push a rollback that provably restores a previously deployed tree?
@@ -103,8 +167,16 @@ jobs:
               pushed_tree = json.loads(gh("api", f"repos/{repo}/commits/{merge_sha}"))["commit"]["tree"]["sha"]
               workflow_file = os.path.basename(os.environ.get("GITHUB_WORKFLOW_REF", "deploy.yml").split("@")[0])
               runs = json.loads(gh("api", f"repos/{repo}/actions/workflows/{workflow_file}/runs"
-                                          f"?branch=main&event=push&status=success&per_page=20")).get("workflow_runs", [])
-              live = next((r for r in runs if r.get("head_sha") != merge_sha), None)
+                                          f"?branch=main&event=push&per_page=30")).get("workflow_runs", [])
+
+              def deploy_job_succeeded(run):
+                  # A successful run is not a successful deployment: with the deploy
+                  # disabled, deploy-production is skipped and the run still succeeds.
+                  jobs = json.loads(gh("api", f"repos/{repo}/actions/runs/{run['id']}/jobs?per_page=100")).get("jobs", [])
+                  return any(j.get("name") == "deploy-production" and j.get("conclusion") == "success" for j in jobs)
+
+              live = next((r for r in runs if r.get("head_sha") != merge_sha and r.get("status") == "completed"
+                           and deploy_job_succeeded(r)), None)
               if live is None:
                   print("no previous successful deployment found; rollback exception not applicable")
               else:
@@ -125,10 +197,24 @@ jobs:
           # No exclusion for "our own" open canary: a re-run of this workflow
           # during its own active window is a second deployment attempt and
           # must wait for the monitor to close or trip the first record.
+          # Open items hold. Labels are never trusted to lift a hold: a recovered
+          # incident stays a hold until a HUMAN closes it, and an incident closed by
+          # anyone else within the lookback still holds (issue events are immutable).
+          humans = set(os.environ.get("HUMANS", "tzhouam").split())
           blocking = []
           for label in ("maintainer:canary", "maintainer:incident", "maintainer:rollback"):
               for issue in issues(label):
                   blocking.append(f"#{issue['number']} ({label}) {issue.get('title')}")
+          for issue in issues("maintainer:incident", state="closed"):
+              events = json.loads(gh("api", "--paginate", "--slurp",
+                                     f"repos/{repo}/issues/{issue['number']}/events?per_page=100"))
+              closer = ""
+              for page in events:
+                  for ev in page:
+                      if ev.get("event") == "closed":
+                          closer = (ev.get("actor") or {}).get("login") or ""
+              if closer not in humans:
+                  blocking.append(f"#{issue['number']} (incident closed by '{closer or 'unknown'}', not a human)")
           if blocking:
               print("deployment blocked; resolve or wait for these to close, then re-run this workflow run:")
               print("\n".join(blocking))

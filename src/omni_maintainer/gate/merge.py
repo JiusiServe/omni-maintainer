@@ -18,6 +18,22 @@ from .bar import BarResult
 CHECK_NAME = "maintainer-gate"
 
 
+def publish_pending(gh: Gh, *, repo: str, head_sha: str, details_url: str = "") -> Any:
+    """Create an ``in_progress`` ``maintainer-gate`` check run BEFORE evaluating.
+
+    Rulesets consider the newest check run of a name on a commit, so an
+    evaluator that crashes after this call leaves a pending run in place
+    of any earlier success: a stale success can never stand while a new
+    objection or hold goes unrecorded.
+    """
+    payload = {"name": CHECK_NAME, "head_sha": head_sha, "status": "in_progress",
+               "output": {"title": "maintainer-gate evaluating", "summary": "evaluation in progress"}}
+    if details_url:
+        payload["details_url"] = details_url
+    return gh.write(["api", f"repos/{repo}/check-runs", "-X", "POST", "--input", "-"],
+                    stdin=json.dumps(payload)).json()
+
+
 def publish_check(gh: Gh, *, repo: str, head_sha: str, result: BarResult,
                   details_url: str = "") -> Any:
     """Create the ``maintainer-gate`` check run for ``head_sha``.
