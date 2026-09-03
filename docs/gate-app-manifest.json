@@ -1,0 +1,16 @@
+{
+  "name": "omni-maintainer-gate",
+  "url": "https://github.com/JiusiServe/omni-maintainer",
+  "description": "Publishes the maintainer-gate check and the reviewer verdict. Its key lives only in a gate environment restricted to main, so no pull-request head can mint its token.",
+  "public": false,
+  "hook_attributes": {"active": false},
+  "default_permissions": {
+    "checks": "write",
+    "contents": "write",
+    "issues": "write",
+    "pull_requests": "write",
+    "actions": "read",
+    "metadata": "read"
+  },
+  "default_events": []
+}
