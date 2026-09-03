@@ -1,0 +1,84 @@
+# Fragment for JiusiServe/omni-reviewbot .github/workflows/deploy.yml.
+#
+# The Phase 0 pull request lands, atomically with the pin-file change and
+# its test updates:
+#   - `deploy/canary_guard.py` (copy of workflows/rb-canary-guard.py here)
+#   - the `canary-record` job below, between build-and-test and deploy-production
+#   - `canary-record` added to deploy-production.needs
+#   - the `deploy-guard` step as deploy-production's FIRST step
+#   - the same predicate on both jobs:
+#       github.event_name == 'push' && github.ref == 'refs/heads/main'
+#       && vars.PRODUCTION_DEPLOY_ENABLED == 'true'
+#     so a manual workflow_dispatch is build-only and a disabled deployment
+#     records no phantom canary.
+#
+# What the script checks, live, from immutable facts only (Actions run and
+# job metadata, commit trees, the branch tip, issue events; issue bodies are
+# written, never trusted):
+#   record mode (canary-record): main still at github.sha; no open canary,
+#     incident or rollback and no incident closed by a non-human within
+#     30 days, unless the push is a verified rollback (GitHub associates it
+#     with a merged maintainer:rollback PR AND its tree equals what the
+#     currently live deployment, by deploy-production job success, replaced);
+#     both dashboards readable (three attempts, else the deploy is blocked);
+#     one record per (run_id, run_attempt), authored by github-actions[bot].
+#   guard mode (deploy-production, seconds before the deploy script): the
+#     same tip and holds checks re-read live (this run's own record exempt),
+#     PRODUCTION_DEPLOY_ENABLED still true, a record for exactly this
+#     attempt exists, and the pre-deploy counters are posted as a
+#     workflow-authored comment the monitor trusts.
+#
+# Atomicity: canary-record runs under its own concurrency group with
+# cancel-in-progress false, so two pushes serialize; the existing
+# reviewbot-production-deploy group serializes the deploy itself.
+# Retry: after a run whose canary-record succeeded, "re-run failed jobs"
+# cannot create a record for the new attempt and the guard refuses; use
+# "re-run all jobs" or push again once the open window closes.
+jobs:
+  canary-record:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.PRODUCTION_DEPLOY_ENABLED == 'true'
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    concurrency:
+      group: reviewbot-canary-record
+      cancel-in-progress: false
+    # Job-level permissions REPLACE the workflow-level set: every read the
+    # script performs is listed (branch tip and commit trees, PR association,
+    # run metadata) plus the issue write for the record.
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: read
+      actions: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+          sparse-checkout: deploy/canary_guard.py
+          sparse-checkout-cone-mode: false
+      - name: Record the canary for this deploy attempt
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_EVENT_BEFORE: ${{ github.event.before }}
+          GITHUB_HEAD_MESSAGE: ${{ github.event.head_commit.message }}
+          HUMANS: "tzhouam"   # the policy's allowlisted humans, space separated
+        run: python3 deploy/canary_guard.py record
+
+  # deploy-production: add `canary-record` to `needs`, the predicate above,
+  # `permissions: { contents: read, issues: write, pull-requests: read, actions: read }`
+  # and these as its FIRST two steps (the job currently only downloads the
+  # artifact, so the script must be checked out first; the self-hosted
+  # runner has python3 and gh):
+  #
+  #     - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+  #       with:
+  #         persist-credentials: false
+  #         sparse-checkout: deploy/canary_guard.py
+  #         sparse-checkout-cone-mode: false
+  #     - name: deploy-guard (everything live, seconds before deploying)
+  #       env:
+  #         GH_TOKEN: ${{ github.token }}
+  #         GITHUB_EVENT_BEFORE: ${{ github.event.before }}
+  #         GITHUB_HEAD_MESSAGE: ${{ github.event.head_commit.message }}
+  #         HUMANS: "tzhouam"
+  #       run: python3 deploy/canary_guard.py guard

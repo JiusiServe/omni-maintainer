@@ -1,0 +1,431 @@
+"""Canary records and tick evaluation.
+
+A canary is a GitHub issue created by the ``canary-record.yml`` workflow on
+every push to the reviewbot's ``main``. Its body carries a JSON record; the
+monitor appends one tick comment per run and this module decides, from the
+record plus all ticks so far, what happens next. The decision is a pure
+function so every rule is unit-tested against recorded dashboards.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import re
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from typing import Any
+
+from ..gate.reads import parse_time
+from .dashboard import Digest, watcher_dead
+
+RECORD_MARKER = "omni-maintainer:canary:v1"
+TICK_MARKER = "omni-maintainer:tick:v1"
+PREDEPLOY_MARKER = "omni-maintainer:predeploy:v1"
+_RECORD_RE = re.compile(r"<!--\s*omni-maintainer:canary:v1\s+(\{.*?\})\s*-->", re.S)
+_TICK_RE = re.compile(r"<!--\s*omni-maintainer:tick:v1\s+(\{.*?\})\s*-->", re.S)
+_PREDEPLOY_RE = re.compile(r"<!--\s*omni-maintainer:predeploy:v1\s+(\{.*?\})\s*-->", re.S)
+
+
+@dataclass(frozen=True)
+class PreDeploy:
+    """Counters the deploy job captured seconds before deploying (a
+    workflow-authored comment). Failures from ``captured_at`` on belong to
+    the new release; nothing from the queue gap does."""
+
+    captured_at: datetime
+    counts_failed: dict[str, int]
+    max_job_ids: dict[str, int]
+
+    @classmethod
+    def parse(cls, body: str) -> "PreDeploy | None":
+        match = _PREDEPLOY_RE.search(body or "")
+        if not match:
+            return None
+        try:
+            data = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            return None
+        stamp = parse_time(data.get("captured_at"))
+        if stamp is None:
+            return None
+        return cls(stamp, {str(k): int(v) for k, v in (data.get("counts_failed") or {}).items()},
+                   {str(k): int(v) for k, v in (data.get("max_job_ids") or {}).items()})
+
+WAIT = "wait"            # deploy run not finished; do nothing
+START = "start"          # deploy succeeded; record baseline, window starts now
+TRIP = "trip"            # regression; open a rollback
+CLOSE = "close"          # window passed clean
+HOLD = "hold"            # deploy stuck waiting for approval; needs a human
+DEPLOY_FAILED = "deploy_failed"  # server-deploy.sh already rolled back
+
+
+@dataclass(frozen=True)
+class Baseline:
+    mean_attention: float
+    max_attention: int
+    mean_gate_failures: float
+    counts_failed: int
+    review_failed: int
+    gate_failures: int
+    split_failed: int
+    last_scan_at: str | None
+    started_at: str
+    # Per-instance highest job id at window start. Jobs above it are "since
+    # the deploy"; one shared number would let one busy instance hide the
+    # other's failures, and an undeclared field would be lost on reload.
+    max_job_ids: dict[str, int] = field(default_factory=dict)
+    # When the pre-deploy reading was taken (counters and cursors).
+    captured_at: str = ""
+    # When this attempt's deploy-production job actually started (server
+    # stamped). Failures are attributed to the deploy from here: the
+    # capture may precede runner queueing or approval by hours, and
+    # failures in that gap belong to the previous release.
+    attribute_from: str = ""
+
+    def to_json(self) -> dict[str, Any]:
+        data = self.__dict__.copy()
+        data["max_job_ids"] = dict(self.max_job_ids)
+        return data
+
+    @property
+    def failures_from(self) -> datetime | None:
+        return parse_time(self.attribute_from) or parse_time(self.started_at) or parse_time(self.captured_at)
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> "Baseline":
+        raw_ids = data.get("max_job_ids") or {}
+        return cls(
+            mean_attention=float(data.get("mean_attention") or 0.0),
+            max_attention=int(data.get("max_attention") or 0),
+            mean_gate_failures=float(data.get("mean_gate_failures") or 0.0),
+            counts_failed=int(data.get("counts_failed") or 0),
+            review_failed=int(data.get("review_failed") or 0),
+            gate_failures=int(data.get("gate_failures") or 0),
+            split_failed=int(data.get("split_failed") or 0),
+            last_scan_at=data.get("last_scan_at"),
+            started_at=str(data.get("started_at") or ""),
+            max_job_ids={str(k): int(v) for k, v in raw_ids.items()} if isinstance(raw_ids, dict) else {},
+            captured_at=str(data.get("captured_at") or ""),
+            attribute_from=str(data.get("attribute_from") or ""),
+        )
+
+
+@dataclass
+class CanaryRecord:
+    repo: str
+    merge_sha: str
+    pre_merge_sha: str
+    pr_number: int | None
+    deploy_run_id: int | None
+    opened_at: str
+    kind: str = "rb"
+    baseline: Baseline | None = None
+    status: str = "pending"  # pending | running | closed
+    # github.actor of the push, stamped by the deploy workflow itself.
+    pusher: str = ""
+
+    def to_marker(self) -> str:
+        payload = {
+            "repo": self.repo, "merge_sha": self.merge_sha, "pre_merge_sha": self.pre_merge_sha,
+            "pr_number": self.pr_number, "deploy_run_id": self.deploy_run_id,
+            "opened_at": self.opened_at, "kind": self.kind, "status": self.status,
+            "baseline": self.baseline.to_json() if self.baseline else None,
+            "pusher": self.pusher,
+        }
+        return f"<!-- {RECORD_MARKER} {json.dumps(payload, sort_keys=True)} -->"
+
+    @classmethod
+    def parse(cls, body: str) -> "CanaryRecord | None":
+        match = _RECORD_RE.search(body or "")
+        if not match:
+            return None
+        try:
+            data = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            return None
+        baseline = data.get("baseline")
+        return cls(
+            repo=str(data.get("repo") or ""),
+            merge_sha=str(data.get("merge_sha") or ""),
+            pre_merge_sha=str(data.get("pre_merge_sha") or ""),
+            pr_number=int(data["pr_number"]) if data.get("pr_number") else None,
+            deploy_run_id=int(data["deploy_run_id"]) if data.get("deploy_run_id") else None,
+            opened_at=str(data.get("opened_at") or ""),
+            kind=str(data.get("kind") or "rb"),
+            baseline=Baseline.from_json(baseline) if isinstance(baseline, dict) else None,
+            status=str(data.get("status") or "pending"),
+            pusher=str(data.get("pusher") or ""),
+        )
+
+
+@dataclass(frozen=True)
+class Tick:
+    at: datetime
+    digests: dict[str, Digest]          # instance -> digest
+    deploy_status: str                  # queued|in_progress|waiting|completed|unknown
+    deploy_conclusion: str | None       # success|failure|cancelled|None
+    new_jobs_total: int                 # jobs across instances with id > baseline max
+    failed_jobs_total: int              # failed jobs across instances with id > baseline max
+
+    def to_marker(self) -> str:
+        payload = {
+            "at": self.at.isoformat(),
+            "deploy_status": self.deploy_status,
+            "deploy_conclusion": self.deploy_conclusion,
+            "new_jobs_total": self.new_jobs_total,
+            "failed_jobs_total": self.failed_jobs_total,
+            "digests": {name: d.to_json() for name, d in self.digests.items()},
+        }
+        return f"<!-- {TICK_MARKER} {json.dumps(payload, sort_keys=True)} -->"
+
+
+@dataclass(frozen=True)
+class TickView:
+    """A tick as recovered from a comment: only the fields rules need."""
+
+    at: datetime
+    deploy_status: str
+    deploy_conclusion: str | None
+    new_jobs_total: int
+    failed_jobs_total: int
+    down: dict[str, bool]
+    watcher_dead: dict[str, bool]
+    maintenance: dict[str, bool]
+    review_failed: dict[str, int]
+    gate_failures: dict[str, int]
+    split_failed: dict[str, int]
+    last_scan_at: dict[str, str | None]
+    # Absolute count of jobs in a failed state (the ledger's jobs table),
+    # monotonic under normal operation; the only counter the rules use.
+    counts_failed: dict[str, int] = field(default_factory=dict)
+
+    @classmethod
+    def parse(cls, body: str, *, watcher_multiplier: float) -> "TickView | None":
+        match = _TICK_RE.search(body or "")
+        if not match:
+            return None
+        try:
+            data = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            return None
+        at = parse_time(data.get("at"))
+        if at is None:
+            return None
+        digests = data.get("digests") or {}
+        view = cls(
+            at=at, deploy_status=str(data.get("deploy_status") or "unknown"),
+            deploy_conclusion=data.get("deploy_conclusion"),
+            new_jobs_total=int(data.get("new_jobs_total") or 0),
+            failed_jobs_total=int(data.get("failed_jobs_total") or 0),
+            down={}, watcher_dead={}, maintenance={}, review_failed={},
+            gate_failures={}, split_failed={}, last_scan_at={},
+        )
+        for name, d in digests.items():
+            ok = bool(d.get("ok"))
+            view.down[name] = not ok
+            view.maintenance[name] = bool(d.get("maintenance"))
+            scan = parse_time(d.get("last_scan_at"))
+            view.watcher_dead[name] = (not ok) or watcher_dead(
+                scan, poll_interval_seconds=int(d.get("poll_interval_seconds") or 120),
+                now=at, multiplier=watcher_multiplier)
+            view.review_failed[name] = int(d.get("review_failed") or 0)
+            view.gate_failures[name] = int(d.get("gate_failures") or 0)
+            view.split_failed[name] = int(d.get("split_failed") or 0)
+            view.last_scan_at[name] = d.get("last_scan_at")
+            view.counts_failed[name] = int((d.get("counts") or {}).get("failed") or 0)
+        return view
+
+
+@dataclass(frozen=True)
+class Decision:
+    action: str
+    reason: str
+    details: dict[str, Any] = field(default_factory=dict)
+
+
+def baseline_from(digests: dict[str, Digest], *, started_at: datetime | None,
+                  captured_at: datetime | None = None) -> Baseline:
+    """Baseline from the primary instance's history: every completed day the
+    dashboard reports (its 14-day window minus today, i.e. 13 full days),
+    plus the absolute counters and per-instance job cursors at capture time.
+
+    ``started_at`` is None when captured before the deploy (by the deploy
+    run or by a pre-deploy tick); the window opens when it is set.
+    """
+    primary = digests.get("vllm_omni") or next(iter(digests.values()))
+    days = list(primary.history_days)[:-1] if len(primary.history_days) > 1 else list(primary.history_days)
+    attention = [int(d.get("attention") or 0) for d in days]
+    gate = [int(d.get("gate_failures") or 0) for d in days]
+    return Baseline(
+        mean_attention=(sum(attention) / len(attention)) if attention else 0.0,
+        max_attention=max(attention) if attention else 0,
+        mean_gate_failures=(sum(gate) / len(gate)) if gate else 0.0,
+        counts_failed=sum(d.counts.get("failed", 0) for d in digests.values()),
+        review_failed=sum(d.review_failed for d in digests.values()),
+        gate_failures=sum(d.gate_failures for d in digests.values()),
+        split_failed=sum(d.split_failed for d in digests.values()),
+        last_scan_at=primary.last_scan_at.isoformat() if primary.last_scan_at else None,
+        started_at=started_at.isoformat() if started_at else "",
+        max_job_ids={name: d.max_job_id for name, d in digests.items()},
+        captured_at=(captured_at or started_at or primary.fetched_at).isoformat(),
+    )
+
+
+def open_window(baseline: Baseline, *, started_at: datetime,
+                pre_deploy: PreDeploy | None = None,
+                attribute_from: datetime | None = None) -> Baseline:
+    """The baseline with the window start stamped on it.
+
+    Counters and traffic cursors come from ``pre_deploy`` when the deploy
+    job captured them seconds before deploying: that excludes the queue and
+    approval gap without losing anything between the deploy and the first
+    monitor tick (re-reading the dashboards at the first tick would erase
+    exactly those failures). Without a pre-deploy capture the job's earlier
+    pre-queue reading stays in force and the gap is charged to this release,
+    which errs toward tripping, never toward passing. ``attribute_from`` is
+    the deploy job's server-stamped start.
+    """
+    cursors = dict(baseline.max_job_ids)
+    counts_failed = baseline.counts_failed
+    origin = attribute_from or started_at
+    if pre_deploy is not None:
+        for name, value in pre_deploy.max_job_ids.items():
+            cursors[name] = max(int(cursors.get(name, 0)), int(value))
+        counts_failed = sum(pre_deploy.counts_failed.values())
+        origin = pre_deploy.captured_at
+    return Baseline(**{**baseline.__dict__, "max_job_ids": cursors, "counts_failed": counts_failed,
+                       "started_at": started_at.isoformat(),
+                       "captured_at": baseline.captured_at or started_at.isoformat(),
+                       "attribute_from": origin.isoformat()})
+
+
+def jobs_since(baseline: Baseline, digests: dict[str, Digest]) -> tuple[int, int]:
+    """(new jobs, failed jobs) across instances since the window start.
+
+    New jobs are counted by id above the per-instance baseline (traffic);
+    failures by ``updated_at`` after the pre-deploy capture instant
+    (``captured_at``, falling back to ``started_at``), so a job that was
+    already running at deploy time and failed afterwards, or one that failed
+    between the capture and the first post-deploy tick, is attributed to
+    the deploy.
+    """
+    from .dashboard import new_failed_jobs
+
+    since = baseline.failures_from
+    new_total = 0
+    failed_total = 0
+    for name, d in digests.items():
+        cursor = int(baseline.max_job_ids.get(name, 0))
+        new_total += sum(1 for j in d.jobs if int(j.get("id") or 0) > cursor)
+        failed_total += len(new_failed_jobs(d.jobs, after=since))
+    return new_total, failed_total
+
+
+def evaluate(record: CanaryRecord, ticks: list[TickView], *, now: datetime,
+             policy: dict[str, Any]) -> Decision:
+    """Decide the canary's next step from its record and all ticks so far.
+
+    ``ticks`` must be in chronological order and include the current tick
+    last. Rules follow the approved plan §5.
+    """
+    if not ticks:
+        return Decision(WAIT, "no tick recorded yet")
+    current = ticks[-1]
+    c = policy["canary"]
+
+    # Before the window: only the deploy run matters. ``record.baseline`` is
+    # captured by the deploy run itself before deploy-production (its
+    # ``started_at`` is empty until the window opens); a record without one
+    # gets the first tick's reading, which is still pre-deploy while the run
+    # is queued or in progress.
+    if record.baseline is None or not record.baseline.started_at:
+        if current.deploy_status == "completed":
+            if current.deploy_conclusion == "success":
+                if record.baseline is None:
+                    # The deploy job captures the baseline before deploying and
+                    # fails without one; a record lacking it is not something
+                    # the monitor can repair after the fact.
+                    return Decision(HOLD, "deploy succeeded but the record carries no pre-deploy baseline; "
+                                          "the window cannot be judged", {"rule": "no_baseline"})
+                return Decision(START, "deploy run succeeded; window starts")
+            # Any non-success conclusion, failure included, leaves the host in
+            # an unverified state: the job can fail before the deploy script
+            # runs, and the script's own restore path emits no success
+            # evidence we can read. Hold for a human; never assume a
+            # restoration nobody observed.
+            rule = "deploy_failed" if current.deploy_conclusion == "failure" else "deploy_incomplete"
+            return Decision(HOLD, f"deploy run ended {current.deploy_conclusion!r}; production state unverified "
+                                  "(the host's restore path may or may not have run)",
+                            {"rule": rule, "conclusion": current.deploy_conclusion})
+        opened = parse_time(record.opened_at)
+        if current.deploy_status == "waiting" and opened is not None and \
+                now - opened > timedelta(hours=float(c["deploy_waiting_hold_hours"])):
+            return Decision(HOLD, "deploy run has been waiting for approval beyond the hold limit")
+        return Decision(WAIT, f"deploy run is {current.deploy_status}")
+
+    started = parse_time(record.baseline.started_at) or now
+    window = [t for t in ticks if t.at >= started]
+    if not window:
+        return Decision(WAIT, "window has not received a tick yet")
+    hours_open = max((now - started).total_seconds() / 3600.0, 0.0)
+    base = record.baseline
+
+    # Trip rules.
+    for name in current.down:
+        if len(window) >= 2 and all(t.down.get(name) for t in window[-int(c["down_ticks_to_trip"]):]) \
+                and len(window) >= int(c["down_ticks_to_trip"]):
+            return Decision(TRIP, f"{name}: dashboard unreachable on {c['down_ticks_to_trip']} consecutive ticks",
+                            {"rule": "endpoint_down", "instance": name})
+    grace = timedelta(minutes=float(c["start_grace_minutes"]))
+    if now - started > grace:
+        for name, dead in current.watcher_dead.items():
+            if dead and not current.down.get(name):
+                return Decision(TRIP, f"{name}: watcher has not scanned within the allowed interval",
+                                {"rule": "watcher_dead", "instance": name})
+    # Per-job evidence (failed-class jobs updated since the attempt started)
+    # is the primary signal; the dashboard's review_stats are a rolling
+    # window of recent reviews and are never used as counters.
+    threshold = max(int(c["failed_jobs_floor"]),
+                    math.ceil(float(c["failed_jobs_multiplier"]) * base.mean_attention * hours_open / 24.0))
+    if current.failed_jobs_total > threshold:
+        return Decision(TRIP, f"{current.failed_jobs_total} failed jobs since deploy, above {threshold}",
+                        {"rule": "failed_jobs", "threshold": threshold})
+    # The absolute failed-job count from the jobs table is monotonic: a
+    # regression means the telemetry itself is invalid (a wiped ledger, a
+    # different instance answering), which is a hold, never a pass.
+    counts_now = sum(current.counts_failed.values()) if current.counts_failed else None
+    # Only when every instance answered: a down instance reports no counter,
+    # which would look like a regression.
+    if counts_now is not None and not any(current.down.values()):
+        counts_delta = counts_now - base.counts_failed
+        if counts_delta < 0:
+            return Decision(HOLD, f"failed-job counter regressed from {base.counts_failed} to {counts_now}; "
+                                  "telemetry invalid", {"rule": "invalid_telemetry"})
+        if counts_delta > threshold:
+            return Decision(TRIP, f"failed-job counter rose by {counts_delta} since deploy, above {threshold}",
+                            {"rule": "counts_failed", "delta": counts_delta, "threshold": threshold})
+    regressions = 0
+    for name in current.last_scan_at:
+        previous: datetime | None = None
+        for t in window:
+            stamp = parse_time(t.last_scan_at.get(name))
+            if previous is not None and stamp is not None and stamp < previous:
+                regressions += 1
+            if stamp is not None:
+                previous = stamp
+    if regressions >= int(c["scan_regressions_to_trip"]):
+        return Decision(TRIP, f"watcher scan time regressed {regressions} times (restart loop)",
+                        {"rule": "scan_regression", "count": regressions})
+
+    # Close rules.
+    if len(window) >= int(c["min_ticks"]) and current.new_jobs_total >= int(c["min_new_jobs"]):
+        return Decision(CLOSE, "window passed with enough traffic", {"outcome": "passed"})
+    if hours_open >= float(c["max_hours"]):
+        # Fail closed at the cap: a service that saw fewer jobs than the
+        # minimum in a whole day is itself anomalous, so the window ends in
+        # a hold that a human closes after verifying production.
+        return Decision(HOLD, f"window hit the {c['max_hours']} h cap with only {current.new_jobs_total} new jobs "
+                              f"(minimum {c['min_new_jobs']}); production unverified",
+                        {"rule": "low_traffic", "new_jobs": current.new_jobs_total})
+    return Decision(WAIT, f"{len(window)} ticks, {current.new_jobs_total} new jobs; window continues")
