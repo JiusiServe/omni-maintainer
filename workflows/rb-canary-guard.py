@@ -16,7 +16,9 @@ Environment (set by the workflow): GITHUB_REPOSITORY, GITHUB_SHA,
 GITHUB_RUN_ID, GITHUB_RUN_ATTEMPT, GITHUB_ACTOR, GITHUB_EVENT_BEFORE
 (``${{ github.event.before }}``), GITHUB_HEAD_MESSAGE
 (``${{ github.event.head_commit.message }}``), GITHUB_SERVER_URL,
-GH_TOKEN, and HUMANS (space-separated allowlisted logins).
+GH_TOKEN, HUMANS (space-separated allowlisted logins), LEDGER_REPO and
+LEDGER_ISSUE (the pinned ledger issue, whose ``maintainer:paused`` label
+is the live kill switch), and optionally DEPLOY_COOLDOWN_HOURS.
 """
 
 from __future__ import annotations
@@ -157,13 +159,42 @@ def check_cooldown(min_hours: float) -> None:
     print("cooldown elapsed since the previous successful deployment")
 
 
-def check_deploy_flag() -> None:
+def check_not_paused() -> None:
+    """The live kill switch: the ``maintainer:paused`` label on the ledger issue.
+
+    ``vars.PRODUCTION_DEPLOY_ENABLED`` is read by GitHub when the run is
+    QUEUED, so it cannot stop a run already under way, and ``GITHUB_TOKEN``
+    cannot re-read it (there is no ``variables:`` permission a workflow can
+    request). The ledger issue can be read live with ``issues: read``, and
+    its label is already the documented pause. Provenance is asymmetric:
+    a human ``labeled`` event pauses until a human ``unlabeled`` event, and
+    events by anyone else count in neither direction, so no automation can
+    pause the system or lift a human's pause. A ledger that cannot be read
+    is itself a refusal.
+    """
+    issue_number = os.environ.get("LEDGER_ISSUE") or ""
+    ledger_repo = os.environ.get("LEDGER_REPO") or REPO
+    if not issue_number.isdigit():
+        fail("LEDGER_ISSUE is not configured; refusing to deploy without a readable kill switch")
     try:
-        value = gh("variable", "get", "PRODUCTION_DEPLOY_ENABLED", "-R", REPO).strip()
-    except subprocess.CalledProcessError:
-        value = ""
-    if value != "true":
-        fail(f"PRODUCTION_DEPLOY_ENABLED is now {value!r}; refusing to deploy")
+        events = api(f"repos/{ledger_repo}/issues/{int(issue_number)}/events?per_page=100", paginate=True)
+    except subprocess.CalledProcessError as exc:
+        fail(f"ledger issue {ledger_repo}#{issue_number} is unreadable ({exc}); refusing to deploy")
+    paused = False
+    who = ""
+    for event in events:
+        if (event.get("label") or {}).get("name") != "maintainer:paused":
+            continue
+        actor = (event.get("actor") or {}).get("login") or ""
+        if actor not in HUMANS:
+            continue
+        if event.get("event") == "labeled":
+            paused, who = True, actor
+        elif event.get("event") == "unlabeled":
+            paused, who = False, ""
+    if paused:
+        fail(f"the maintainer is paused: {who} labelled {ledger_repo}#{issue_number} maintainer:paused; refusing to deploy")
+    print(f"ledger {ledger_repo}#{issue_number} is not paused")
 
 
 def deploy_job_succeeded(run: dict) -> bool:
@@ -214,8 +245,13 @@ def check_holds(exempt_issue_number: int | None) -> None:
     seen = set()
     # Canary records are recognised by authorship and marker, never by label:
     # removing a label from a workflow-authored record does not lift its hold.
-    for issue in api(f"repos/{REPO}/issues?creator={WORKFLOW_LOGIN}&state=open&per_page=100", paginate=True):
+    # Every open issue is scanned rather than filtering by creator, because a
+    # login filter on a bot account is easy to get wrong and a missed record
+    # would silently lift a hold.
+    for issue in api(f"repos/{REPO}/issues?state=open&per_page=100", paginate=True):
         if "pull_request" in issue or "omni-maintainer:canary:v1" not in (issue.get("body") or ""):
+            continue
+        if (issue.get("user") or {}).get("login") != WORKFLOW_LOGIN:
             continue
         if exempt_issue_number is not None and int(issue["number"]) == exempt_issue_number:
             continue  # this attempt's own record; every earlier attempt still holds
@@ -274,6 +310,7 @@ COOLDOWN_HOURS = float(os.environ.get("DEPLOY_COOLDOWN_HOURS") or 4)
 
 def mode_record() -> None:
     check_tip()
+    check_not_paused()
     check_pusher()
     if not rollback_exception():
         check_cooldown(COOLDOWN_HOURS)
@@ -323,7 +360,7 @@ def mode_guard() -> None:
     """deploy-production's first step: everything live, seconds before deploying."""
     check_tip()
     check_pusher()
-    check_deploy_flag()
+    check_not_paused()
     if not rollback_exception():
         check_cooldown(COOLDOWN_HOURS)
     issue, _ = record_for_this_attempt()
