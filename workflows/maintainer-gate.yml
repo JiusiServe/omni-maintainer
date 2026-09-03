@@ -97,7 +97,7 @@ jobs:
           with open(os.environ["GITHUB_OUTPUT"], "a") as out:
               out.write("pending=" + json.dumps(picked) + "\n")
           PY
-      - name: Review each pending head with Claude (read-only, adversarial rubric)
+      - name: Build the reviewer's pending list (the review itself is the Claude step below)
         if: steps.queue.outputs.pending != '[]'
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
