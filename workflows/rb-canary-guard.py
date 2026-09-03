@@ -7,18 +7,23 @@ Copied into omni-reviewbot as ``deploy/canary_guard.py`` by the Phase 0
   python3 deploy/canary_guard.py record   # canary-record job
   python3 deploy/canary_guard.py guard    # deploy-production's first step
 
-Both modes re-read everything live from GitHub and the dashboards and exit
-non-zero to block deployment. Every fact comes from immutable Actions run
-and job metadata, commit trees, or the branch tip; issue bodies are only
-ever written here, never trusted as evidence. Standard library only.
+Both modes re-read everything live and exit non-zero to block deployment.
+Every fact comes from immutable Actions run and job metadata, commit trees,
+the branch tip, or issue events; issue bodies are only ever written here,
+never trusted as evidence.
+
+Standard library only, and no ``gh`` CLI: the deploy job runs on a
+self-hosted runner that is not guaranteed to have it, and a guard that
+cannot run is a guard that blocks every deployment.
 
 Environment (set by the workflow): GITHUB_REPOSITORY, GITHUB_SHA,
 GITHUB_RUN_ID, GITHUB_RUN_ATTEMPT, GITHUB_ACTOR, GITHUB_EVENT_BEFORE
 (``${{ github.event.before }}``), GITHUB_HEAD_MESSAGE
 (``${{ github.event.head_commit.message }}``), GITHUB_SERVER_URL,
-GH_TOKEN, HUMANS (space-separated allowlisted logins), LEDGER_REPO and
-LEDGER_ISSUE (the pinned ledger issue, whose ``maintainer:paused`` label
-is the live kill switch), and optionally DEPLOY_COOLDOWN_HOURS.
+GITHUB_API_URL, GITHUB_WORKFLOW_REF, GH_TOKEN (or GITHUB_TOKEN), HUMANS
+(space-separated allowlisted logins), LEDGER_REPO and LEDGER_ISSUE (the
+pinned ledger issue, whose ``maintainer:paused`` label is the live kill
+switch), and optionally DEPLOY_COOLDOWN_HOURS and DASHBOARDS.
 """
 
 from __future__ import annotations
@@ -26,39 +31,37 @@ from __future__ import annotations
 import json
 import os
 import re
-import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-REPO = os.environ["GITHUB_REPOSITORY"]
-SHA = os.environ["GITHUB_SHA"]
-RUN_ID = int(os.environ["GITHUB_RUN_ID"])
+REPO = os.environ.get("GITHUB_REPOSITORY", "")
+SHA = os.environ.get("GITHUB_SHA", "")
+RUN_ID = int(os.environ.get("GITHUB_RUN_ID") or 0)
 RUN_ATTEMPT = int(os.environ.get("GITHUB_RUN_ATTEMPT") or 1)
-HUMANS = set((os.environ.get("HUMANS") or "tzhouam").split())
+HUMANS = set((os.environ.get("HUMANS") or "").split())
+API = (os.environ.get("GITHUB_API_URL") or "https://api.github.com").rstrip("/")
+TOKEN = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN") or ""
 WORKFLOW_FILE = os.path.basename((os.environ.get("GITHUB_WORKFLOW_REF") or "deploy.yml").split("@")[0])
+COOLDOWN_HOURS = float(os.environ.get("DEPLOY_COOLDOWN_HOURS") or 4)
 DASHBOARDS = {
-    "vllm_omni": "http://review.43.155.186.30.nip.io/code_review/vllm_omni",
-    "vllm_gr": "http://review.43.155.186.30.nip.io/code_review/vllm_gr",
+    name: url for name, url in (
+        pair.split("=", 1) for pair in (os.environ.get("DASHBOARDS") or (
+            "vllm_omni=http://review.43.155.186.30.nip.io/code_review/vllm_omni,"
+            "vllm_gr=http://review.43.155.186.30.nip.io/code_review/vllm_gr")).split(",") if pair
+    )
 }
 CANARY_LABEL = "maintainer:canary"
 HOLD_LABELS = ("maintainer:canary", "maintainer:incident", "maintainer:rollback")
+CANARY_MARKER = "omni-maintainer:canary:v1"
 WORKFLOW_LOGIN = "github-actions[bot]"
+MAX_COMPARE_FILES = 300
 
 
-def gh(*args: str, stdin: str | None = None) -> str:
-    return subprocess.run(["gh", *args], text=True, capture_output=True, check=True, input=stdin).stdout
-
-
-def api(path: str, paginate: bool = False):
-    if paginate:
-        pages = json.loads(gh("api", "--paginate", "--slurp", path))
-        out = []
-        for page in pages:
-            out.extend(page if isinstance(page, list) else [page])
-        return out
-    return json.loads(gh("api", path))
+class ApiError(RuntimeError):
+    pass
 
 
 def fail(message: str) -> None:
@@ -66,35 +69,96 @@ def fail(message: str) -> None:
     sys.exit(1)
 
 
+def _request(method: str, url: str, body: dict | None = None) -> tuple[bytes, dict]:
+    data = json.dumps(body).encode() if body is not None else None
+    request = urllib.request.Request(url, data=data, method=method)
+    request.add_header("Accept", "application/vnd.github+json")
+    request.add_header("X-GitHub-Api-Version", "2022-11-28")
+    request.add_header("User-Agent", "omni-maintainer-canary-guard")
+    if TOKEN:
+        request.add_header("Authorization", f"Bearer {TOKEN}")
+    if data is not None:
+        request.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:  # noqa: S310 - fixed API host
+            return response.read(), dict(response.headers)
+    except urllib.error.HTTPError as exc:
+        raise ApiError(f"{method} {url} -> HTTP {exc.code}: {exc.read()[:200]!r}") from exc
+    except (urllib.error.URLError, OSError) as exc:
+        raise ApiError(f"{method} {url} -> {exc}") from exc
+
+
+def api(path: str, *, paginate: bool = False):
+    """GET one API path; with ``paginate``, follow ``Link: rel="next"``."""
+    url = path if path.startswith("http") else f"{API}/{path}"
+    body, headers = _request("GET", url)
+    first = json.loads(body)
+    if not paginate:
+        return first
+    items = list(first) if isinstance(first, list) else [first]
+    while True:
+        link = headers.get("Link") or ""
+        match = re.search(r'<([^>]+)>;\s*rel="next"', link)
+        if not match:
+            return items
+        body, headers = _request("GET", match.group(1))
+        page = json.loads(body)
+        items.extend(page if isinstance(page, list) else [page])
+
+
+def post(path: str, body: dict):
+    return json.loads(_request("POST", f"{API}/{path}", body)[0])
+
+
+def parse_time(value) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
 def issues(label: str, state: str = "open"):
     since = ""
     if state == "closed":
         since = "&since=" + (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
     return [i for i in api(f"repos/{REPO}/issues?labels={label}&state={state}{since}&per_page=100", paginate=True)
-            if "pull_request" not in i]
+            if isinstance(i, dict) and "pull_request" not in i]
+
+
+def canary_record(issue: dict) -> dict | None:
+    """The record embedded in a workflow-authored canary issue, or None."""
+    if (issue.get("user") or {}).get("login") != WORKFLOW_LOGIN:
+        return None
+    match = re.search(r"<!--\s*" + CANARY_MARKER + r"\s+(\{.*?\})\s*-->", issue.get("body") or "", re.S)
+    if not match:
+        return None
+    try:
+        return json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return None
 
 
 def record_for_this_attempt():
     """The workflow-authored canary record for (run_id, run_attempt), if any.
 
     Issue bodies are editable, so authorship alone is not enough: an old
-    workflow-created issue could be edited to claim this attempt. The
-    record must also have been CREATED (immutable timestamp) after this run
-    was created, which only a record written by this run can satisfy.
+    workflow-created issue could be edited to claim this attempt. The record
+    must also have been CREATED (immutable timestamp) at or after this run,
+    which only a record written by this run can satisfy.
     """
-    run_created = datetime.fromisoformat(api(f"repos/{REPO}/actions/runs/{RUN_ID}")["created_at"].replace("Z", "+00:00"))
-    for issue in issues(CANARY_LABEL, "all"):
-        if (issue.get("user") or {}).get("login") != WORKFLOW_LOGIN:
+    run_created = parse_time(api(f"repos/{REPO}/actions/runs/{RUN_ID}").get("created_at"))
+    for issue in api(f"repos/{REPO}/issues?state=all&labels={CANARY_LABEL}&per_page=100", paginate=True):
+        if not isinstance(issue, dict) or "pull_request" in issue:
             continue
-        created = datetime.fromisoformat(str(issue.get("created_at") or "1970-01-01T00:00:00Z").replace("Z", "+00:00"))
-        if created < run_created:
+        created = parse_time(issue.get("created_at"))
+        if run_created and created and created < run_created:
             continue
-        m = re.search(r"<!--\s*omni-maintainer:canary:v1\s+(\{.*?\})\s*-->", issue.get("body") or "", re.S)
-        if not m:
-            continue
-        rec = json.loads(m.group(1))
-        if int(rec.get("deploy_run_id") or 0) == RUN_ID and int(rec.get("run_attempt") or 1) == RUN_ATTEMPT:
-            return issue, rec
+        record = canary_record(issue)
+        if record and int(record.get("deploy_run_id") or 0) == RUN_ID \
+                and int(record.get("run_attempt") or 1) == RUN_ATTEMPT:
+            return issue, record
     return None, None
 
 
@@ -107,24 +171,58 @@ def check_tip() -> None:
     print(f"main is still at {SHA}")
 
 
+def check_not_paused() -> None:
+    """The live kill switch: ``maintainer:paused`` on the ledger issue.
+
+    ``vars.PRODUCTION_DEPLOY_ENABLED`` is read by GitHub when the run is
+    QUEUED, so it cannot stop a run already under way, and no workflow
+    permission lets a token re-read it. The ledger issue can be read live
+    with ``issues: read``, and its label is already the documented pause.
+    Provenance is asymmetric: a human ``labeled`` event pauses until a human
+    ``unlabeled`` event, and events by anyone else count in neither
+    direction, so no automation can pause the system or lift a human's
+    pause. A ledger that cannot be read is itself a refusal.
+    """
+    number = os.environ.get("LEDGER_ISSUE") or ""
+    ledger_repo = os.environ.get("LEDGER_REPO") or REPO
+    if not number.isdigit():
+        fail("LEDGER_ISSUE is not configured; refusing to deploy without a readable kill switch")
+    try:
+        events = api(f"repos/{ledger_repo}/issues/{int(number)}/events?per_page=100", paginate=True)
+    except ApiError as exc:
+        fail(f"ledger {ledger_repo}#{number} is unreadable ({exc}); refusing to deploy")
+    paused, who = False, ""
+    for event in events:
+        if (event.get("label") or {}).get("name") != "maintainer:paused":
+            continue
+        actor = (event.get("actor") or {}).get("login") or ""
+        if actor not in HUMANS:
+            continue
+        if event.get("event") == "labeled":
+            paused, who = True, actor
+        elif event.get("event") == "unlabeled":
+            paused, who = False, ""
+    if paused:
+        fail(f"the maintainer is paused: {who} labelled {ledger_repo}#{number} maintainer:paused; refusing to deploy")
+    print(f"ledger {ledger_repo}#{number} is not paused")
+
+
 def check_pusher() -> None:
     """Block a non-human push synchronously, before anything deploys.
 
     ``GITHUB_ACTOR`` is the server-stamped identity of the push. It must be
-    an allowlisted human, and a merge commit must additionally be the
-    GitHub-confirmed merge of a pull request into ``main`` by that human.
-    Hourly detection would be too late: the commit would already be live.
+    an allowlisted human, and a merge commit must additionally be GitHub's
+    own record of a pull request merged into ``main`` by an allowlisted
+    human. The commit message is never consulted.
     """
+    if not HUMANS:
+        fail("HUMANS is empty; refusing to deploy without an allowlist to check the pusher against")
     actor = os.environ.get("GITHUB_ACTOR") or ""
     if actor not in HUMANS:
         fail(f"push actor {actor!r} is not an allowlisted human; refusing to deploy")
     parents = api(f"repos/{REPO}/commits/{SHA}").get("parents", [])
     if len(parents) >= 2:
-        # A merge commit must be GitHub's own record of a pull request merged
-        # into main by an allowlisted human. The association endpoint is
-        # server-side; the commit message is not consulted at all.
-        associated = api(f"repos/{REPO}/commits/{SHA}/pulls")
-        confirmed = [p for p in associated
+        confirmed = [p for p in api(f"repos/{REPO}/commits/{SHA}/pulls")
                      if p.get("merged_at") and p.get("merge_commit_sha") == SHA
                      and (p.get("base") or {}).get("ref") == "main"]
         if not confirmed:
@@ -137,75 +235,53 @@ def check_pusher() -> None:
     print(f"push by allowlisted human {actor}")
 
 
-def check_cooldown(min_hours: float) -> None:
-    """An immutable hold that no issue state can lift: no deployment within
-    ``min_hours`` of the previous successful deploy-production job (Actions
-    job metadata), except a verified rollback. This bounds what a routine
-    that closes or unlabels canary and incident issues could achieve."""
-    runs = api(f"repos/{REPO}/actions/workflows/{WORKFLOW_FILE}/runs?branch=main&event=push&per_page=30").get("workflow_runs", [])
+def deploy_job(run_id: int) -> dict | None:
+    """The ``deploy-production`` job of a run, or None when it never ran.
+
+    A run can complete successfully with that job skipped (deployment
+    disabled), which is not a deployment.
+    """
+    for job in api(f"repos/{REPO}/actions/runs/{int(run_id)}/jobs?per_page=100").get("jobs", []):
+        if job.get("name") == "deploy-production":
+            return job
+    return None
+
+
+def live_deployment() -> dict | None:
+    """The newest push run of this workflow on main whose deploy job succeeded."""
+    runs = api(f"repos/{REPO}/actions/workflows/{WORKFLOW_FILE}/runs"
+               f"?branch=main&event=push&per_page=30").get("workflow_runs", [])
     for run in runs:
         if run.get("head_sha") == SHA or run.get("status") != "completed":
             continue
-        jobs = api(f"repos/{REPO}/actions/runs/{run['id']}/jobs?per_page=100").get("jobs", [])
-        job = next((j for j in jobs if j.get("name") == "deploy-production" and j.get("conclusion") == "success"), None)
-        if job is None:
-            continue
-        completed = job.get("completed_at") or ""
-        done = datetime.fromisoformat(completed.replace("Z", "+00:00")) if completed else None
-        if done and datetime.now(timezone.utc) - done < timedelta(hours=min_hours):
-            fail(f"previous deployment {run['head_sha'][:8]} completed at {completed}; the {min_hours} h "
-                 "cooldown has not elapsed (no issue state can shorten it)")
-        break
+        job = deploy_job(int(run["id"]))
+        if job and job.get("conclusion") == "success":
+            return {"run": run, "job": job}
+    return None
+
+
+def check_cooldown(live: dict | None) -> None:
+    """An immutable hold no issue state can lift: no deployment within
+    ``COOLDOWN_HOURS`` of the previous successful one. This bounds what a
+    routine that closes or unlabels canary and incident issues could do."""
+    if live is None:
+        print("no previous successful deployment; cooldown not applicable")
+        return
+    done = parse_time(live["job"].get("completed_at"))
+    if done and datetime.now(timezone.utc) - done < timedelta(hours=COOLDOWN_HOURS):
+        fail(f"previous deployment {live['run']['head_sha'][:8]} completed at {done.isoformat()}; the "
+             f"{COOLDOWN_HOURS} h cooldown has not elapsed (no issue state can shorten it)")
     print("cooldown elapsed since the previous successful deployment")
 
 
-def check_not_paused() -> None:
-    """The live kill switch: the ``maintainer:paused`` label on the ledger issue.
+def rollback_exception(live: dict | None) -> bool:
+    """Is this push a verified rollback of the currently live deployment?
 
-    ``vars.PRODUCTION_DEPLOY_ENABLED`` is read by GitHub when the run is
-    QUEUED, so it cannot stop a run already under way, and ``GITHUB_TOKEN``
-    cannot re-read it (there is no ``variables:`` permission a workflow can
-    request). The ledger issue can be read live with ``issues: read``, and
-    its label is already the documented pause. Provenance is asymmetric:
-    a human ``labeled`` event pauses until a human ``unlabeled`` event, and
-    events by anyone else count in neither direction, so no automation can
-    pause the system or lift a human's pause. A ledger that cannot be read
-    is itself a refusal.
+    (a) GitHub associates the commit with a merged ``maintainer:rollback``
+    pull request into main, and (b) the pushed tree equals the tree that the
+    live deployment replaced, that is the tree of its head commit's first
+    parent. Run and job metadata and commit trees only; no issue is read.
     """
-    issue_number = os.environ.get("LEDGER_ISSUE") or ""
-    ledger_repo = os.environ.get("LEDGER_REPO") or REPO
-    if not issue_number.isdigit():
-        fail("LEDGER_ISSUE is not configured; refusing to deploy without a readable kill switch")
-    try:
-        events = api(f"repos/{ledger_repo}/issues/{int(issue_number)}/events?per_page=100", paginate=True)
-    except subprocess.CalledProcessError as exc:
-        fail(f"ledger issue {ledger_repo}#{issue_number} is unreadable ({exc}); refusing to deploy")
-    paused = False
-    who = ""
-    for event in events:
-        if (event.get("label") or {}).get("name") != "maintainer:paused":
-            continue
-        actor = (event.get("actor") or {}).get("login") or ""
-        if actor not in HUMANS:
-            continue
-        if event.get("event") == "labeled":
-            paused, who = True, actor
-        elif event.get("event") == "unlabeled":
-            paused, who = False, ""
-    if paused:
-        fail(f"the maintainer is paused: {who} labelled {ledger_repo}#{issue_number} maintainer:paused; refusing to deploy")
-    print(f"ledger {ledger_repo}#{issue_number} is not paused")
-
-
-def deploy_job_succeeded(run: dict) -> bool:
-    jobs = api(f"repos/{REPO}/actions/runs/{run['id']}/jobs?per_page=100").get("jobs", [])
-    return any(j.get("name") == "deploy-production" and j.get("conclusion") == "success" for j in jobs)
-
-
-def rollback_exception() -> bool:
-    """Is this push the merge of a maintainer:rollback PR whose tree equals the
-    tree that the currently live deployment replaced? Facts: GitHub's PR
-    association, run and job metadata, commit trees. No issue is consulted."""
     associated = api(f"repos/{REPO}/commits/{SHA}/pulls")
     rollback_prs = [p for p in associated
                     if p.get("merged_at") and p.get("merge_commit_sha") == SHA
@@ -213,63 +289,55 @@ def rollback_exception() -> bool:
                     and any(l.get("name") == "maintainer:rollback" for l in p.get("labels") or [])]
     if not rollback_prs:
         return False
-    pushed_tree = api(f"repos/{REPO}/commits/{SHA}")["commit"]["tree"]["sha"]
-    runs = api(f"repos/{REPO}/actions/workflows/{WORKFLOW_FILE}/runs?branch=main&event=push&per_page=30").get("workflow_runs", [])
-    live = next((r for r in runs if r.get("head_sha") != SHA and r.get("status") == "completed"
-                 and deploy_job_succeeded(r)), None)
     if live is None:
-        print("no previous successful deployment found; rollback exception not applicable")
+        print("no previous successful deployment; the rollback exception does not apply")
         return False
-    parents = [p["sha"] for p in api(f"repos/{REPO}/commits/{live['head_sha']}").get("parents", [])]
+    pushed_tree = api(f"repos/{REPO}/commits/{SHA}")["commit"]["tree"]["sha"]
+    deployed = live["run"]["head_sha"]
+    parents = [p["sha"] for p in api(f"repos/{REPO}/commits/{deployed}").get("parents", [])]
     if not parents:
         return False
     pre_tree = api(f"repos/{REPO}/commits/{parents[0]}")["commit"]["tree"]["sha"]
     if pre_tree == pushed_tree:
         print(f"rollback exception: PR #{rollback_prs[0]['number']} restores the tree that the live deployment "
-              f"{live['head_sha'][:8]} (run {live['id']}) replaced")
+              f"{deployed[:8]} (run {live['run']['id']}) replaced")
         return True
-    print(f"rollback PR does not restore what the live deployment {live['head_sha'][:8]} replaced")
+    print(f"rollback PR does not restore what the live deployment {deployed[:8]} replaced")
     return False
 
 
 def check_holds(exempt_issue_number: int | None) -> None:
-    """Open canaries, incidents and rollbacks hold; so does any incident closed
-    by a non-human within 30 days (labels never lift a hold). In guard mode
-    exactly one issue is exempt: the validated, workflow-authored record of
-    this attempt, identified by its issue number (never by a body
-    substring, which any labeled issue could forge). The rollback exception
-    admits a verified restoration."""
-    if rollback_exception():
-        return
-    blocking = []
-    seen = set()
-    # Canary records are recognised by authorship and marker, never by label:
-    # removing a label from a workflow-authored record does not lift its hold.
-    # Every open issue is scanned rather than filtering by creator, because a
-    # login filter on a bot account is easy to get wrong and a missed record
-    # would silently lift a hold.
+    """Open canaries, incidents and rollbacks hold; so does any incident
+    closed by a non-human within 30 days. Labels never lift a hold: canary
+    records are recognised by authorship and marker, so removing a label
+    from one changes nothing. In guard mode exactly one issue is exempt,
+    identified by number, and only in its role as this attempt's canary: if
+    that same issue also carries an incident or rollback label, it holds.
+    """
+    blocking, seen = [], set()
     for issue in api(f"repos/{REPO}/issues?state=open&per_page=100", paginate=True):
-        if "pull_request" in issue or "omni-maintainer:canary:v1" not in (issue.get("body") or ""):
+        if not isinstance(issue, dict) or "pull_request" in issue or canary_record(issue) is None:
             continue
-        if (issue.get("user") or {}).get("login") != WORKFLOW_LOGIN:
-            continue
-        if exempt_issue_number is not None and int(issue["number"]) == exempt_issue_number:
+        number = int(issue["number"])
+        if exempt_issue_number is not None and number == exempt_issue_number:
             continue  # this attempt's own record; every earlier attempt still holds
-        seen.add(int(issue["number"]))
-        blocking.append(f"#{issue['number']} (open canary record) {issue.get('title')}")
+        seen.add(number)
+        blocking.append(f"#{number} (open canary record) {issue.get('title')}")
     for label in HOLD_LABELS:
         for issue in issues(label):
-            if int(issue["number"]) in seen:
+            number = int(issue["number"])
+            if number in seen:
                 continue
-            if exempt_issue_number is not None and label == CANARY_LABEL and int(issue["number"]) == exempt_issue_number:
-                continue
-            seen.add(int(issue["number"]))
-            blocking.append(f"#{issue['number']} ({label}) {issue.get('title')}")
+            if label == CANARY_LABEL and number == exempt_issue_number:
+                continue  # exempt as this attempt's canary ONLY; an incident or
+                # rollback label on the same issue still holds
+            seen.add(number)
+            blocking.append(f"#{number} ({label}) {issue.get('title')}")
     for issue in issues("maintainer:incident", "closed"):
         closer = ""
-        for ev in api(f"repos/{REPO}/issues/{issue['number']}/events?per_page=100", paginate=True):
-            if ev.get("event") == "closed":
-                closer = (ev.get("actor") or {}).get("login") or ""
+        for event in api(f"repos/{REPO}/issues/{issue['number']}/events?per_page=100", paginate=True):
+            if event.get("event") == "closed":
+                closer = (event.get("actor") or {}).get("login") or ""
         if closer not in HUMANS:
             blocking.append(f"#{issue['number']} (incident closed by {closer or 'unknown'!r}, not a human)")
     if blocking:
@@ -283,8 +351,10 @@ def read_dashboards() -> dict:
         last = None
         for _ in range(3):
             try:
-                with urllib.request.urlopen(base + "/api/status", timeout=90) as resp:
-                    payload = json.loads(resp.read().decode("utf-8"))
+                request = urllib.request.Request(base.rstrip("/") + "/api/status",
+                                                 headers={"User-Agent": "omni-maintainer-canary-guard"})
+                with urllib.request.urlopen(request, timeout=90) as response:  # noqa: S310 - fixed http URL
+                    payload = json.loads(response.read().decode("utf-8"))
                 if not isinstance(payload, dict) or "jobs" not in payload or "history" not in payload:
                     raise ValueError("malformed status payload")
                 readings[name] = payload
@@ -303,24 +373,29 @@ def counters(readings: dict) -> tuple[dict, dict]:
     return failed, ids
 
 
-# ---------------------------------------------------------------- modes
-
-COOLDOWN_HOURS = float(os.environ.get("DEPLOY_COOLDOWN_HOURS") or 4)
-
-
-def mode_record() -> None:
+def preflight(exempt_issue_number: int | None) -> None:
+    """Every check both modes share, in refusal order."""
     check_tip()
     check_not_paused()
     check_pusher()
-    if not rollback_exception():
-        check_cooldown(COOLDOWN_HOURS)
-    check_holds(exempt_issue_number=None)
+    live = live_deployment()
+    if not rollback_exception(live):
+        check_cooldown(live)
+        check_holds(exempt_issue_number)
+    else:
+        print("verified rollback: cooldown and holds do not apply")
+
+
+# ---------------------------------------------------------------- modes
+
+def mode_record() -> None:
+    preflight(exempt_issue_number=None)
     existing, _ = record_for_this_attempt()
     if existing:
         print(f"canary already recorded for this attempt: #{existing['number']}")
         return
     readings = read_dashboards()
-    primary = readings["vllm_omni"]
+    primary = readings.get("vllm_omni") or next(iter(readings.values()))
     days = (primary.get("history") or {}).get("days") or []
     done = days[:-1] if len(days) > 1 else days
     attention = [int(d.get("attention") or 0) for d in done]
@@ -332,9 +407,11 @@ def mode_record() -> None:
         "max_attention": max(attention) if attention else 0,
         "mean_gate_failures": (sum(gate) / len(gate)) if gate else 0.0,
         "counts_failed": sum(failed.values()),
-        "review_failed": sum(int(((r.get("review_stats") or {}).get("outcomes") or {}).get("failed") or 0) for r in readings.values()),
+        "review_failed": sum(int(((r.get("review_stats") or {}).get("outcomes") or {}).get("failed") or 0)
+                             for r in readings.values()),
         "gate_failures": sum(int((r.get("review_stats") or {}).get("gate_failures") or 0) for r in readings.values()),
-        "split_failed": sum(int(((r.get("split") or {}).get("attempts") or {}).get("failed") or 0) for r in readings.values()),
+        "split_failed": sum(int(((r.get("split") or {}).get("attempts") or {}).get("failed") or 0)
+                            for r in readings.values()),
         "last_scan_at": (primary.get("metadata") or {}).get("last_scan_at"),
         "started_at": "", "captured_at": now, "attribute_from": "", "max_job_ids": ids,
     }
@@ -344,45 +421,49 @@ def mode_record() -> None:
               "pr_number": int(pr.group(1)) if pr else None, "deploy_run_id": RUN_ID, "run_attempt": RUN_ATTEMPT,
               "opened_at": now, "kind": "rb", "status": "pending", "baseline": baseline,
               "pusher": os.environ.get("GITHUB_ACTOR") or ""}
+    server = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
     body = "\n".join([
         f"Deploy of `{SHA}` (previous `{record['pre_merge_sha']}`), run "
-        f"{os.environ.get('GITHUB_SERVER_URL', 'https://github.com')}/{REPO}/actions/runs/{RUN_ID} attempt {RUN_ATTEMPT}",
+        f"{server}/{REPO}/actions/runs/{RUN_ID} attempt {RUN_ATTEMPT}",
         f"PR: #{record['pr_number']}" if record["pr_number"] else "PR: (direct push)",
         "", "The monitor appends one tick comment per hour and closes this issue when the window passes.",
-        "", f"<!-- omni-maintainer:canary:v1 {json.dumps(record, sort_keys=True)} -->",
+        "", f"<!-- {CANARY_MARKER} {json.dumps(record, sort_keys=True)} -->",
     ])
-    out = gh("api", f"repos/{REPO}/issues", "-X", "POST", "--input", "-",
-             stdin=json.dumps({"title": f"[canary] deploy {SHA[:8]}", "body": body, "labels": [CANARY_LABEL]}))
-    print("canary recorded:", json.loads(out)["html_url"])
+    created = post(f"repos/{REPO}/issues",
+                   {"title": f"[canary] deploy {SHA[:8]}", "body": body, "labels": [CANARY_LABEL]})
+    print("canary recorded:", created.get("html_url"))
 
 
 def mode_guard() -> None:
     """deploy-production's first step: everything live, seconds before deploying."""
-    check_tip()
-    check_pusher()
-    check_not_paused()
-    if not rollback_exception():
-        check_cooldown(COOLDOWN_HOURS)
     issue, _ = record_for_this_attempt()
     if issue is None:
         fail(f"no canary record for run {RUN_ID} attempt {RUN_ATTEMPT}; refusing to deploy "
              "(after a successful canary-record, use 're-run all jobs', not 're-run failed jobs')")
-    check_holds(exempt_issue_number=int(issue["number"]))
+    preflight(exempt_issue_number=int(issue["number"]))
     readings = read_dashboards()
     failed, ids = counters(readings)
     pre = {"captured_at": datetime.now(timezone.utc).isoformat(), "counts_failed": failed, "max_job_ids": ids}
-    body = "pre-deploy counters captured by the deploy job\n\n<!-- omni-maintainer:predeploy:v1 " + \
-        json.dumps(pre, sort_keys=True) + " -->"
-    gh("api", f"repos/{REPO}/issues/{issue['number']}/comments", "-X", "POST", "--input", "-",
-       stdin=json.dumps({"body": body}))
+    post(f"repos/{REPO}/issues/{int(issue['number'])}/comments",
+         {"body": "pre-deploy counters captured by the deploy job\n\n"
+                  f"<!-- omni-maintainer:predeploy:v1 {json.dumps(pre, sort_keys=True)} -->"})
     print(f"pre-deploy counters posted on canary #{issue['number']}; deploying")
 
 
+def main(argv: list[str]) -> None:
+    mode = argv[1] if len(argv) > 1 else ""
+    if not REPO or not SHA or not RUN_ID:
+        fail("GITHUB_REPOSITORY, GITHUB_SHA and GITHUB_RUN_ID must be set")
+    try:
+        if mode == "record":
+            mode_record()
+        elif mode == "guard":
+            mode_guard()
+        else:
+            fail("usage: canary_guard.py record|guard")
+    except ApiError as exc:
+        fail(f"GitHub API read failed, refusing to deploy: {exc}")
+
+
 if __name__ == "__main__":
-    mode = sys.argv[1] if len(sys.argv) > 1 else ""
-    if mode == "record":
-        mode_record()
-    elif mode == "guard":
-        mode_guard()
-    else:
-        fail("usage: canary_guard.py record|guard")
+    main(sys.argv)
