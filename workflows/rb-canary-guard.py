@@ -17,7 +17,8 @@ self-hosted runner that is not guaranteed to have it, and a guard that
 cannot run is a guard that blocks every deployment.
 
 Environment (set by the workflow): GITHUB_REPOSITORY, GITHUB_SHA,
-GITHUB_RUN_ID, GITHUB_RUN_ATTEMPT, GITHUB_ACTOR, GITHUB_EVENT_BEFORE
+GITHUB_RUN_ID, GITHUB_RUN_ATTEMPT, GITHUB_ACTOR, GITHUB_TRIGGERING_ACTOR,
+GITHUB_EVENT_BEFORE
 (``${{ github.event.before }}``), GITHUB_HEAD_MESSAGE
 (``${{ github.event.head_commit.message }}``), GITHUB_SERVER_URL,
 GITHUB_API_URL, GITHUB_WORKFLOW_REF, GH_TOKEN (or GITHUB_TOKEN), HUMANS
@@ -57,7 +58,9 @@ CANARY_LABEL = "maintainer:canary"
 HOLD_LABELS = ("maintainer:canary", "maintainer:incident", "maintainer:rollback")
 CANARY_MARKER = "omni-maintainer:canary:v1"
 WORKFLOW_LOGIN = "github-actions[bot]"
-MAX_COMPARE_FILES = 300
+MAX_RUN_PAGES = 10          # the runs API returns at most 1000 matches, whatever we ask for
+RUN_WINDOWS_DAYS = (7, 30, 90, 365, None)   # widened until a deployment is found; None = every run
+RERUN_LIMIT_DAYS = 31       # GitHub allows re-running a run for 30 days after it was created
 
 
 class ApiError(RuntimeError):
@@ -122,7 +125,11 @@ def parse_time(value) -> datetime | None:
 def issues(label: str, state: str = "open"):
     since = ""
     if state == "closed":
-        since = "&since=" + (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        # "Z", never isoformat(): a "+00:00" offset decodes as a space in a
+        # query string and GitHub rejects the request, which would turn every
+        # hold check into a refusal.
+        stamp = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        since = f"&since={stamp}"
     return [i for i in api(f"repos/{REPO}/issues?labels={label}&state={state}{since}&per_page=100", paginate=True)
             if isinstance(i, dict) and "pull_request" not in i]
 
@@ -140,8 +147,12 @@ def canary_record(issue: dict) -> dict | None:
         return None
 
 
-def record_for_this_attempt():
+def record_for_this_attempt(require_open: bool = False):
     """The workflow-authored canary record for (run_id, run_attempt), if any.
+
+    ``require_open`` refuses a record that has since been closed: a deploy
+    that waited in a queue must not proceed after its canary was closed,
+    which would leave the deployment unwatched.
 
     Issue bodies are editable, so authorship alone is not enough: an old
     workflow-created issue could be edited to claim this attempt. The record
@@ -158,6 +169,9 @@ def record_for_this_attempt():
         record = canary_record(issue)
         if record and int(record.get("deploy_run_id") or 0) == RUN_ID \
                 and int(record.get("run_attempt") or 1) == RUN_ATTEMPT:
+            if require_open and issue.get("state") != "open":
+                fail(f"the canary record for run {RUN_ID} attempt {RUN_ATTEMPT} (#{issue['number']}) is "
+                     f"{issue.get('state')!r}, not open; refusing to deploy without an active canary")
             return issue, record
     return None, None
 
@@ -210,16 +224,23 @@ def check_not_paused() -> None:
 def check_pusher() -> None:
     """Block a non-human push synchronously, before anything deploys.
 
-    ``GITHUB_ACTOR`` is the server-stamped identity of the push. It must be
-    an allowlisted human, and a merge commit must additionally be GitHub's
-    own record of a pull request merged into ``main`` by an allowlisted
-    human. The commit message is never consulted.
+    ``GITHUB_ACTOR`` is the server-stamped identity of the push and
+    ``GITHUB_TRIGGERING_ACTOR`` of the run (they differ on a rerun); both
+    must be allowlisted humans. A merge commit must additionally be
+    GitHub's own record of a pull request merged into ``main`` by an
+    allowlisted human. The commit message is never consulted.
     """
     if not HUMANS:
         fail("HUMANS is empty; refusing to deploy without an allowlist to check the pusher against")
     actor = os.environ.get("GITHUB_ACTOR") or ""
     if actor not in HUMANS:
         fail(f"push actor {actor!r} is not an allowlisted human; refusing to deploy")
+    # On a rerun GITHUB_ACTOR stays the original pusher; whoever pressed
+    # re-run is GITHUB_TRIGGERING_ACTOR, and they must be allowlisted too,
+    # or any collaborator could redeploy an allowlisted human's push.
+    triggering = os.environ.get("GITHUB_TRIGGERING_ACTOR") or actor
+    if triggering not in HUMANS:
+        fail(f"the run was triggered by {triggering!r}, not an allowlisted human; refusing to deploy")
     parents = api(f"repos/{REPO}/commits/{SHA}").get("parents", [])
     if len(parents) >= 2:
         confirmed = [p for p in api(f"repos/{REPO}/commits/{SHA}/pulls")
@@ -235,29 +256,138 @@ def check_pusher() -> None:
     print(f"push by allowlisted human {actor}")
 
 
-def deploy_job(run_id: int) -> dict | None:
-    """The ``deploy-production`` job of a run, or None when it never ran.
+def deploy_job(run_id: int, attempt: int | None = None) -> dict | None:
+    """The ``deploy-production`` job of a run, or of one attempt of it.
 
-    A run can complete successfully with that job skipped (deployment
-    disabled), which is not a deployment.
+    Across attempts the newest SUCCESSFUL one wins, because any successful
+    attempt is a real deployment; with none, the newest attempt is returned
+    so callers see its conclusion. A run can complete successfully with the
+    job skipped (deployment disabled), which is not a deployment, so the
+    job's own conclusion is what callers judge.
     """
-    for job in api(f"repos/{REPO}/actions/runs/{int(run_id)}/jobs?per_page=100").get("jobs", []):
-        if job.get("name") == "deploy-production":
-            return job
+    if attempt:
+        path = f"repos/{REPO}/actions/runs/{int(run_id)}/attempts/{int(attempt)}/jobs?per_page=100"
+    else:
+        # filter=all, always: by default GitHub returns only the LATEST
+        # attempt's jobs, so a run whose first attempt deployed and whose
+        # second failed earlier would read as "never deployed", skipping the
+        # cooldown and taking the rollback baseline from an older release.
+        path = f"repos/{REPO}/actions/runs/{int(run_id)}/jobs?filter=all&per_page=100"
+    jobs = [job for job in api(path).get("jobs", []) if job.get("name") == "deploy-production"]
+    if not jobs:
+        return None
+    successful = [job for job in jobs if job.get("conclusion") == "success"]
+    return max(successful or jobs,
+               key=lambda job: (job.get("completed_at") or "", int(job.get("run_attempt") or 0)))
+
+
+def earlier_attempt_deployment() -> dict | None:
+    """A deployment by an earlier attempt of THIS run.
+
+    "Re-run failed jobs" and "re-run all jobs" keep the run id and increment
+    ``run_attempt``, so a successful deploy by an earlier attempt is a real,
+    earlier deployment: the newest one, in fact. Missing it would skip the
+    cooldown and take the rollback baseline from an older release.
+    """
+    if RUN_ATTEMPT <= 1:
+        return None
+    run = api(f"repos/{REPO}/actions/runs/{RUN_ID}")
+    for attempt in range(RUN_ATTEMPT - 1, 0, -1):
+        job = deploy_job(RUN_ID, attempt)
+        if job and job.get("conclusion") == "success":
+            return {"run": run, "job": job, "attempt": attempt}
     return None
+
+
+def _completed(candidate: dict) -> str:
+    return candidate["job"].get("completed_at") or ""
+
+
+def _scan_window(since: str | None, best: dict | None) -> tuple[dict | None, bool]:
+    """(newest deployment in the window, was the window scanned to the end).
+
+    GitHub stops returning results past 1000 matches however many pages are
+    asked for, so an empty page before ``total_count`` is a cut-off, not an
+    exhausted list, and must not be read as "nothing more to see".
+    """
+    seen = 0
+    for page in range(1, MAX_RUN_PAGES + 1):
+        created = f"&created=%3E%3D{since}" if since else ""
+        payload = api(f"repos/{REPO}/actions/workflows/{WORKFLOW_FILE}/runs"
+                      f"?branch=main&event=push{created}&per_page=100&page={page}")
+        runs = payload.get("workflow_runs", [])
+        total = int(payload.get("total_count") or 0)
+        if not runs:
+            return best, seen >= total
+        for run in runs:
+            # Skip only THIS run, whose own earlier attempts are already a
+            # candidate. Skipping every run with this SHA would hide a real
+            # earlier deployment of the same commit (a revert and reapply).
+            # Neither the run's conclusion nor its status is a filter:
+            # deploy-production can succeed in a run that is later cancelled,
+            # that fails elsewhere, or whose newest attempt is still running
+            # after an earlier attempt already deployed. deploy_job reads every
+            # attempt, and the job's own conclusion is what makes a deployment.
+            if int(run.get("id") or 0) == RUN_ID:
+                continue
+            # A run untouched since the best candidate finished cannot hold a
+            # newer deployment (a rerun bumps updated_at), so it needs no job
+            # lookup; that keeps a scan to about one request per page.
+            if best is not None and (run.get("updated_at") or "") <= _completed(best):
+                continue
+            job = deploy_job(int(run["id"]))
+            if job and job.get("conclusion") == "success":
+                if best is None or (job.get("completed_at") or "") > _completed(best):
+                    best = {"run": run, "job": job}
+        seen += len(runs)
+        if seen >= total:
+            return best, True
+    return best, False
 
 
 def live_deployment() -> dict | None:
-    """The newest push run of this workflow on main whose deploy job succeeded."""
-    runs = api(f"repos/{REPO}/actions/workflows/{WORKFLOW_FILE}/runs"
-               f"?branch=main&event=push&per_page=30").get("workflow_runs", [])
-    for run in runs:
-        if run.get("head_sha") == SHA or run.get("status") != "completed":
-            continue
-        job = deploy_job(int(run["id"]))
-        if job and job.get("conclusion") == "success":
-            return {"run": run, "job": job}
-    return None
+    """The deployment that is live now: the one whose deploy job finished last.
+
+    Not simply the newest run: the run list is ordered by creation, and
+    rerunning an older run deploys after a newer one, so the baseline is
+    chosen by the deploy job's own ``completed_at``. An earlier attempt of
+    this run counts as a candidate too.
+
+    Scanned in widening time windows, because the runs API caps at 1000
+    matches: a window that cannot be scanned to its end is a refusal rather
+    than a guess. The last window carries no date filter at all, so "never
+    deployed" means every run GitHub still holds was scanned and none
+    deployed.
+    """
+    best = earlier_attempt_deployment()
+    now = datetime.now(timezone.utc)
+    for days in RUN_WINDOWS_DAYS:
+        since = (now - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ") if days else None
+        best, exhausted = _scan_window(since, best)
+        if not exhausted:
+            fail(f"more than {MAX_RUN_PAGES * 100} push runs in "
+                 f"{f'the last {days} days' if days else 'the whole run history'}, so the list cannot "
+                 "be scanned to its end; refusing rather than risking a stale cooldown and rollback "
+                 "baseline")
+        if best is not None:
+            break
+    if best is None:
+        # The last window carries no date filter, so this is every run GitHub
+        # still holds: the service has never deployed.
+        return None
+    # A run created before the scanned window could still have deployed after
+    # this candidate, but only by being re-run, and GitHub allows that for 30
+    # days after a run is created. One more scan reaching that far back before
+    # the candidate finished therefore settles which deployment is live.
+    finished = parse_time(_completed(best))
+    if finished is None:
+        fail("the newest deployment has no completion time; refusing rather than guessing the baseline")
+    deep_since = (finished - timedelta(days=RERUN_LIMIT_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    best, exhausted = _scan_window(deep_since, best)
+    if not exhausted:
+        fail(f"more than {MAX_RUN_PAGES * 100} push runs since {deep_since}, so a re-run of an older "
+             "run cannot be ruled out; refusing rather than risking a stale baseline")
+    return best
 
 
 def check_cooldown(live: dict | None) -> None:
@@ -435,19 +565,30 @@ def mode_record() -> None:
 
 
 def mode_guard() -> None:
-    """deploy-production's first step: everything live, seconds before deploying."""
-    issue, _ = record_for_this_attempt()
+    """The last step before the deploy command: everything live, twice."""
+    issue, _ = record_for_this_attempt(require_open=True)
     if issue is None:
         fail(f"no canary record for run {RUN_ID} attempt {RUN_ATTEMPT}; refusing to deploy "
              "(after a successful canary-record, use 're-run all jobs', not 're-run failed jobs')")
-    preflight(exempt_issue_number=int(issue["number"]))
+    exempt = int(issue["number"])
+    preflight(exempt_issue_number=exempt)
     readings = read_dashboards()
     failed, ids = counters(readings)
     pre = {"captured_at": datetime.now(timezone.utc).isoformat(), "counts_failed": failed, "max_job_ids": ids}
-    post(f"repos/{REPO}/issues/{int(issue['number'])}/comments",
+    post(f"repos/{REPO}/issues/{exempt}/comments",
          {"body": "pre-deploy counters captured by the deploy job\n\n"
                   f"<!-- omni-maintainer:predeploy:v1 {json.dumps(pre, sort_keys=True)} -->"})
-    print(f"pre-deploy counters posted on canary #{issue['number']}; deploying")
+    # Reading two dashboards can take minutes when either is retrying, and the
+    # deploy command runs as soon as this returns. Re-run every live check so a
+    # push, a pause, a new incident or a closed canary in that window still
+    # stops the deployment. The record is re-read LAST, after the final
+    # preflight, and its absence is as disqualifying as its closure.
+    preflight(exempt_issue_number=exempt)
+    final, _ = record_for_this_attempt(require_open=True)
+    if final is None or int(final["number"]) != exempt:
+        fail(f"the canary record for run {RUN_ID} attempt {RUN_ATTEMPT} is gone or no longer #{exempt}; "
+             "refusing to deploy without an active canary")
+    print(f"pre-deploy counters posted on canary #{exempt}; live checks re-passed; deploying")
 
 
 def main(argv: list[str]) -> None:
