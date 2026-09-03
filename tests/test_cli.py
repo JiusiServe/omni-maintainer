@@ -80,8 +80,32 @@ def test_pending_check_is_published_before_any_read(fake, capsys):
     rc = cli.main(["gate", "evaluate", "--repo", "JiusiServe/InferMatrixCopilot", "--pr", "84", "--publish",
                    "--head", head])
     assert rc == cli.EXIT_FAIL
+    capsys.readouterr()
     checks = [w for w in fake.writes if w[:2] == ["api", "repos/JiusiServe/InferMatrixCopilot/check-runs"]]
     assert len(checks) == 2, "one in_progress run first, then the completed one"
+    # if the head moved since the caller read it, the actual head gets its own pending run as well
+    fake.writes.clear()
+    rc = cli.main(["gate", "evaluate", "--repo", "JiusiServe/InferMatrixCopilot", "--pr", "84", "--publish",
+                   "--head", "0" * 40])
+    capsys.readouterr()
+    checks = [w for w in fake.writes if w[:2] == ["api", "repos/JiusiServe/InferMatrixCopilot/check-runs"]]
+    assert len(checks) == 3, "pending on the stale head, pending on the real head, then the completed one"
+    # and if that second pending publish fails, the job crashes instead of failing the stale head
+    from omni_maintainer.routine.ghcli import GhError
+    calls = {"n": 0}
+
+    def flaky_write(args, stdin=None):
+        if args[:2] == ["api", "repos/JiusiServe/InferMatrixCopilot/check-runs"]:
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise GhError("boom on the real head")
+        return GhResult(True, "", "", dry_run=True)
+
+    fake.write = flaky_write
+    rc = cli.main(["gate", "evaluate", "--repo", "JiusiServe/InferMatrixCopilot", "--pr", "84", "--publish",
+                   "--head", "0" * 40])
+    out = json.loads(capsys.readouterr().out)
+    assert rc == cli.EXIT_CRASH and out["head"] == head and calls["n"] == 2
 
 
 def test_publish_failure_crashes_the_job_instead_of_looking_like_a_failed_bar(fake, capsys):
@@ -97,6 +121,18 @@ def test_publish_failure_crashes_the_job_instead_of_looking_like_a_failed_bar(fa
     out = json.loads(capsys.readouterr().out)
     assert rc == cli.EXIT_CRASH and "publish_error" in out
     assert cli.EXIT_CRASH >= 2 and cli.EXIT_FAIL == 1
+
+
+def test_published_check_stays_pr_local_when_global_state_is_unreadable(fake, capsys, monkeypatch):
+    from omni_maintainer.routine.preflight import PreflightError
+    monkeypatch.setattr(cli, "run_preflight", lambda gh, policy, now: (_ for _ in ()).throw(PreflightError("ledger down")))
+    rc = cli.main(["gate", "evaluate", "--repo", "JiusiServe/InferMatrixCopilot", "--pr", "84"])
+    out = json.loads(capsys.readouterr().out)
+    # the PR's own failures are still reported and the global gap is a note, not a crash
+    assert rc == cli.EXIT_FAIL and any("unreadable" in n for n in out["notes"])
+    # the arbiter's view fails closed instead
+    rc = cli.main(["gate", "evaluate", "--repo", "JiusiServe/InferMatrixCopilot", "--pr", "84", "--enforce-caps"])
+    assert rc == cli.EXIT_CRASH
 
 
 def test_preflight_reports_counters(fake, capsys):

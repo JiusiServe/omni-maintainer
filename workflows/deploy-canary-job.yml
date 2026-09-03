@@ -1,102 +1,39 @@
 # Fragment for JiusiServe/omni-reviewbot .github/workflows/deploy.yml.
 #
-# Splice the `canary-record` job below between `build-and-test` and
-# `deploy-production`, then, in the SAME pull request (these must land
-# atomically with the pin-file change and its test updates):
-#   - add `canary-record` to `deploy-production.needs`
-#   - give deploy-production and canary-record the SAME predicate:
+# The Phase 0 pull request lands, atomically with the pin-file change and
+# its test updates:
+#   - `deploy/canary_guard.py` (copy of workflows/rb-canary-guard.py here)
+#   - the `canary-record` job below, between build-and-test and deploy-production
+#   - `canary-record` added to deploy-production.needs
+#   - the `deploy-guard` step as deploy-production's FIRST step
+#   - the same predicate on both jobs:
 #       github.event_name == 'push' && github.ref == 'refs/heads/main'
 #       && vars.PRODUCTION_DEPLOY_ENABLED == 'true'
-#     so a manual workflow_dispatch is build-only, a disabled deployment
-#     records no phantom canary, and every real deployment has a record
-#     written by its own run (no run-id lookup, no race).
+#     so a manual workflow_dispatch is build-only and a disabled deployment
+#     records no phantom canary.
 #
-# Permissions: the workflow-level block is `contents: read`; this job
-# declares its own `issues: write` (job-level permissions replace the
-# workflow-level set for that job) and uses the default GITHUB_TOKEN.
+# What the script checks, live, from immutable facts only (Actions run and
+# job metadata, commit trees, the branch tip, issue events; issue bodies are
+# written, never trusted):
+#   record mode (canary-record): main still at github.sha; no open canary,
+#     incident or rollback and no incident closed by a non-human within
+#     30 days, unless the push is a verified rollback (GitHub associates it
+#     with a merged maintainer:rollback PR AND its tree equals what the
+#     currently live deployment, by deploy-production job success, replaced);
+#     both dashboards readable (three attempts, else the deploy is blocked);
+#     one record per (run_id, run_attempt), authored by github-actions[bot].
+#   guard mode (deploy-production, seconds before the deploy script): the
+#     same tip and holds checks re-read live (this run's own record exempt),
+#     PRODUCTION_DEPLOY_ENABLED still true, a record for exactly this
+#     attempt exists, and the pre-deploy counters are posted as a
+#     workflow-authored comment the monitor trusts.
 #
-# Atomicity: the job runs under its own concurrency group with
-# cancel-in-progress false, so two pushes serialize here; the second run
-# waits, then sees the first run's open canary and fails. The existing
-# `reviewbot-production-deploy` group still serializes the deploy itself.
-#
-# It fails, and thereby blocks deploy-production, when:
-#   - another canary window, incident or rollback is still open
-#     (one active deployment through the full canary window), or
-#   - the record cannot be created.
-# Rollback exception: a push is admitted despite open items only when
-#   (a) GitHub's own record says the pushed commit is the merge of a pull
-#       request labeled maintainer:rollback into main, and
-#   (b) the pushed commit's TREE equals the tree that the currently live
-#       deployment replaced: the first parent of the head commit of the
-#       newest push run of this workflow on main whose deploy-production
-#       JOB succeeded (a run can succeed with that job skipped). Actions
-#       metadata only; no issue, label or marker is consulted, and a match
-#       against some older deployment proves nothing.
-# Retry: once the open window closes, re-run the run from the Actions UI
-# with "Re-run ALL jobs" (keeps the push context), or push again. A rerun
-# is a new deploy attempt with its own record (run id + run_attempt);
-# "Re-run failed jobs" cannot create that record when the previous
-# attempt's canary-record job had succeeded, so deploy-production's guard
-# refuses it by design. Record identity is (run_id, run_attempt) only.
-#
-# deploy-production must ALSO begin with the two checks below (splice the
-# `deploy-guard` step in as its first step): "Re-run failed jobs" reruns a
-# failed deploy job without rerunning a canary-record job that succeeded
-# earlier, so the deploy job itself re-verifies, for its own run_attempt,
-# that main is still at this commit and that a canary record for exactly
-# (run_id, run_attempt) exists and was authored by the workflow identity.
-#
-#   deploy-production:
-#     permissions: { contents: read, issues: write, actions: read }
-#     steps:
-#       - name: deploy-guard (stale tip / hold provenance / record for this attempt / pre-deploy counters)
-#         env:
-#           GH_TOKEN: ${{ github.token }}
-#           MERGE_SHA: ${{ github.sha }}
-#           RUN_ID: ${{ github.run_id }}
-#           RUN_ATTEMPT: ${{ github.run_attempt }}
-#           HUMANS: "tzhouam"     # the policy's allowlisted humans, space separated
-#         run: |
-#           # Everything is re-read LIVE here, immediately before the deploy script runs, so the
-#           # canary-record job's earlier checks cannot go stale in between (TOCTOU):
-#           tip=$(gh api "repos/${GITHUB_REPOSITORY}/branches/main" -q .commit.sha)
-#           [ "$tip" = "$MERGE_SHA" ] || { echo "stale run: main is at $tip" >&2; exit 1; }
-#           enabled=$(gh variable get PRODUCTION_DEPLOY_ENABLED -R "${GITHUB_REPOSITORY}" 2>/dev/null || echo false)
-#           [ "$enabled" = "true" ] || { echo "PRODUCTION_DEPLOY_ENABLED is now '$enabled'; refusing to deploy" >&2; exit 1; }
-#           # Open canaries/incidents/rollbacks hold, with the same rollback exception as canary-record
-#           # (re-run that job's check here: an open item that appeared since must block).
-#           # Holds are cleared by HUMAN closes only. An incident closed within the last 30 days by
-#           # anyone else (a bot relabeling or closing it) still holds; labels are never trusted here.
-#           since=$(date -u -d '30 days ago' +%Y-%m-%dT%H:%M:%SZ)
-#           for n in $(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues?labels=maintainer:incident&state=closed&since=${since}&per_page=100" --jq '.[] | select(.pull_request == null) | .number'); do
-#             closer=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${n}/events?per_page=100" --jq '[.[] | select(.event=="closed")] | last | .actor.login')
-#             case " $HUMANS " in *" $closer "*) ;; *) echo "incident #$n was closed by '$closer', not a human: still a hold" >&2; exit 1;; esac
-#           done
-#           # the record is one JSON object with sorted keys on one line; both fields must be in the same body
-#           record=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues?labels=maintainer:canary&state=all&per_page=100" \
-#             --jq '.[] | select(.user.login == "github-actions[bot]") | "\(.number) \(.body)"' \
-#             | grep -E "\"deploy_run_id\": ${RUN_ID},.*\"run_attempt\": ${RUN_ATTEMPT}[,}]" | head -n1)
-#           [ -n "$record" ] || { echo "no canary record for run ${RUN_ID} attempt ${RUN_ATTEMPT}; refusing to deploy" >&2; exit 1; }
-#           number=${record%% *}
-#           # Pre-deploy counters, seconds before the deploy, posted as a workflow-authored comment the
-#           # monitor trusts: failures from this instant on are the new release's; nothing from the
-#           # queue/approval gap is, and nothing between the deploy and the first tick is lost.
-#           python3 - "$number" <<'PY'
-#           import json, subprocess, sys, urllib.request
-#           from datetime import datetime, timezone
-#           number = sys.argv[1]; readings = {}
-#           for name, base in (("vllm_omni", "http://review.43.155.186.30.nip.io/code_review/vllm_omni"),
-#                              ("vllm_gr", "http://review.43.155.186.30.nip.io/code_review/vllm_gr")):
-#               with urllib.request.urlopen(base + "/api/status", timeout=90) as r:
-#                   readings[name] = json.loads(r.read().decode("utf-8"))
-#           pre = {"captured_at": datetime.now(timezone.utc).isoformat(),
-#                  "counts_failed": {n: int((r.get("counts") or {}).get("failed") or 0) for n, r in readings.items()},
-#                  "max_job_ids": {n: max((int(j.get("id") or 0) for j in r.get("jobs") or []), default=0) for n, r in readings.items()}}
-#           body = "pre-deploy counters captured by the deploy job\n\n<!-- omni-maintainer:predeploy:v1 " + json.dumps(pre, sort_keys=True) + " -->"
-#           subprocess.run(["gh", "api", f"repos/{__import__('os').environ['GITHUB_REPOSITORY']}/issues/{number}/comments", "-X", "POST", "-f", f"body={body}"], check=True)
-#           PY
-#       - ... the existing deploy steps ...
+# Atomicity: canary-record runs under its own concurrency group with
+# cancel-in-progress false, so two pushes serialize; the existing
+# reviewbot-production-deploy group serializes the deploy itself.
+# Retry: after a run whose canary-record succeeded, "re-run failed jobs"
+# cannot create a record for the new attempt and the guard refuses; use
+# "re-run all jobs" or push again once the open window closes.
 jobs:
   canary-record:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.PRODUCTION_DEPLOY_ENABLED == 'true'
@@ -105,225 +42,43 @@ jobs:
     concurrency:
       group: reviewbot-canary-record
       cancel-in-progress: false
-    # Job-level permissions REPLACE the workflow-level set for this job, so
-    # every read this job performs is listed: branch tip and commit trees
-    # (contents), PR association (pull-requests), run metadata (actions),
-    # and the canary issue itself (issues: write).
+    # Job-level permissions REPLACE the workflow-level set: every read the
+    # script performs is listed (branch tip and commit trees, PR association,
+    # run metadata) plus the issue write for the record.
     permissions:
       contents: read
       issues: write
       pull-requests: read
       actions: read
     steps:
-      - name: Refuse a stale run (main must still be at this commit; re-runs after main advanced deploy nothing)
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+          sparse-checkout: deploy/canary_guard.py
+          sparse-checkout-cone-mode: false
+      - name: Record the canary for this deploy attempt
         env:
           GH_TOKEN: ${{ github.token }}
-          MERGE_SHA: ${{ github.sha }}
-        run: |
-          tip=$(gh api "repos/${GITHUB_REPOSITORY}/branches/main" -q .commit.sha)
-          if [ "$tip" != "$MERGE_SHA" ]; then
-            echo "main is at $tip, this run is for $MERGE_SHA: stale run, refusing to record or deploy" >&2
-            exit 1
-          fi
-          echo "main is still at $MERGE_SHA"
-
-      - name: Refuse to deploy while a canary window, incident or rollback is open (rollback excepted)
-        env:
-          GH_TOKEN: ${{ github.token }}
-          MERGE_SHA: ${{ github.sha }}
-          HEAD_MESSAGE: ${{ github.event.head_commit.message }}
+          GITHUB_EVENT_BEFORE: ${{ github.event.before }}
+          GITHUB_HEAD_MESSAGE: ${{ github.event.head_commit.message }}
           HUMANS: "tzhouam"   # the policy's allowlisted humans, space separated
-        run: |
-          python3 - <<'PY'
-          import json, os, re, subprocess, sys
-          from datetime import datetime, timedelta, timezone
-          repo = os.environ["GITHUB_REPOSITORY"]
-          merge_sha = os.environ["MERGE_SHA"]
-          message = os.environ.get("HEAD_MESSAGE") or ""
+        run: python3 deploy/canary_guard.py record
 
-          def gh(*args):
-              return subprocess.run(["gh", *args], text=True, capture_output=True, check=True).stdout
-
-          def issues(label, state="open"):
-              since = "&since=" + (datetime.now(timezone.utc) - timedelta(days=30)).isoformat() if state == "closed" else ""
-              pages = json.loads(gh("api", "--paginate", "--slurp",
-                                    f"repos/{repo}/issues?labels={label}&state={state}{since}&per_page=100"))
-              return [i for page in pages for i in page if "pull_request" not in i]
-
-          # Is this push a rollback that provably restores a previously deployed tree?
-          # (a) GitHub's association: which PR does this commit merge, and is it a rollback PR into main?
-          rollback_ok = False
-          associated = json.loads(gh("api", f"repos/{repo}/commits/{merge_sha}/pulls"))
-          rollback_prs = [p for p in associated
-                          if p.get("merged_at") and p.get("merge_commit_sha") == merge_sha
-                          and (p.get("base") or {}).get("ref") == "main"
-                          and any(l.get("name") == "maintainer:rollback" for l in p.get("labels") or [])]
-          if rollback_prs:
-              # (b) the pushed tree must equal the tree that the CURRENTLY LIVE deployment
-              # replaced. The live deployment is the newest successful push run of this
-              # workflow on main (Actions run metadata, immutable; no issue is consulted);
-              # the replaced tree is that run's head commit's first parent. A tree that
-              # matches some older deployment proves nothing about the affected one.
-              pushed_tree = json.loads(gh("api", f"repos/{repo}/commits/{merge_sha}"))["commit"]["tree"]["sha"]
-              workflow_file = os.path.basename(os.environ.get("GITHUB_WORKFLOW_REF", "deploy.yml").split("@")[0])
-              runs = json.loads(gh("api", f"repos/{repo}/actions/workflows/{workflow_file}/runs"
-                                          f"?branch=main&event=push&per_page=30")).get("workflow_runs", [])
-
-              def deploy_job_succeeded(run):
-                  # A successful run is not a successful deployment: with the deploy
-                  # disabled, deploy-production is skipped and the run still succeeds.
-                  jobs = json.loads(gh("api", f"repos/{repo}/actions/runs/{run['id']}/jobs?per_page=100")).get("jobs", [])
-                  return any(j.get("name") == "deploy-production" and j.get("conclusion") == "success" for j in jobs)
-
-              live = next((r for r in runs if r.get("head_sha") != merge_sha and r.get("status") == "completed"
-                           and deploy_job_succeeded(r)), None)
-              if live is None:
-                  print("no previous successful deployment found; rollback exception not applicable")
-              else:
-                  deployed = str(live["head_sha"])
-                  deployed_commit = json.loads(gh("api", f"repos/{repo}/commits/{deployed}"))
-                  parents = [p["sha"] for p in deployed_commit.get("parents", [])]
-                  if parents:
-                      pre_tree = json.loads(gh("api", f"repos/{repo}/commits/{parents[0]}"))["commit"]["tree"]["sha"]
-                      if pre_tree == pushed_tree:
-                          rollback_ok = True
-                          print(f"admitting rollback deploy: PR #{rollback_prs[0]['number']} restores the tree that the "
-                                f"live deployment {deployed[:8]} (run {live['id']}) replaced")
-                      else:
-                          print(f"rollback PR does not restore what the live deployment {deployed[:8]} replaced; blocked")
-          if rollback_ok:
-              sys.exit(0)
-
-          # No exclusion for "our own" open canary: a re-run of this workflow
-          # during its own active window is a second deployment attempt and
-          # must wait for the monitor to close or trip the first record.
-          # Open items hold. Labels are never trusted to lift a hold: a recovered
-          # incident stays a hold until a HUMAN closes it, and an incident closed by
-          # anyone else within the lookback still holds (issue events are immutable).
-          humans = set(os.environ.get("HUMANS", "tzhouam").split())
-          blocking = []
-          for label in ("maintainer:canary", "maintainer:incident", "maintainer:rollback"):
-              for issue in issues(label):
-                  blocking.append(f"#{issue['number']} ({label}) {issue.get('title')}")
-          for issue in issues("maintainer:incident", state="closed"):
-              events = json.loads(gh("api", "--paginate", "--slurp",
-                                     f"repos/{repo}/issues/{issue['number']}/events?per_page=100"))
-              closer = ""
-              for page in events:
-                  for ev in page:
-                      if ev.get("event") == "closed":
-                          closer = (ev.get("actor") or {}).get("login") or ""
-              if closer not in humans:
-                  blocking.append(f"#{issue['number']} (incident closed by '{closer or 'unknown'}', not a human)")
-          if blocking:
-              print("deployment blocked; resolve or wait for these to close, then re-run this workflow run:")
-              print("\n".join(blocking))
-              sys.exit(1)
-          print("no open canary, incident or rollback; proceeding")
-          PY
-
-      - name: Record the canary for this deploy attempt (identity: run id + run attempt)
-        env:
-          GH_TOKEN: ${{ github.token }}
-          MERGE_SHA: ${{ github.sha }}
-          PRE_MERGE_SHA: ${{ github.event.before }}
-          RUN_ID: ${{ github.run_id }}
-          RUN_ATTEMPT: ${{ github.run_attempt }}
-          HEAD_MESSAGE: ${{ github.event.head_commit.message }}
-          # Server-stamped identity of whoever pushed: the only push
-          # attribution the monitor trusts (commit metadata is spoofable).
-          PUSHER: ${{ github.actor }}
-        run: |
-          python3 - <<'PY'
-          import json, os, re, subprocess, sys
-          from datetime import datetime, timezone
-
-          repo = os.environ["GITHUB_REPOSITORY"]
-          merge_sha = os.environ["MERGE_SHA"]
-          pre = os.environ.get("PRE_MERGE_SHA") or ""
-          run_id = int(os.environ["RUN_ID"])
-          message = os.environ.get("HEAD_MESSAGE") or ""
-          pusher = os.environ.get("PUSHER") or ""
-          pr = re.match(r"^Merge pull request #(\d+)", message)
-          pr_number = int(pr.group(1)) if pr else None
-          label = "maintainer:canary"
-
-          def gh(*args, stdin=None):
-              return subprocess.run(["gh", *args], text=True, capture_output=True, check=True, input=stdin).stdout
-
-          # One record per deploy ATTEMPT (run id + attempt), never shared across
-          # attempts: a rerun that got past the hold gets its own, non-overlapping
-          # record. Re-executing this very attempt (a job retry) finds its record.
-          run_attempt = int(os.environ.get("RUN_ATTEMPT") or 1)
-          existing = json.loads(gh("api", "--paginate", "--slurp",
-                                   f"repos/{repo}/issues?labels={label}&state=all&per_page=100"))
-          for page in existing:
-              for issue in page:
-                  body_text = issue.get("body") or ""
-                  if f'"deploy_run_id": {run_id}' in body_text and f'"run_attempt": {run_attempt}' in body_text:
-                      print(f"canary already recorded for this attempt: #{issue['number']}")
-                      sys.exit(0)
-
-          # Pre-deploy baseline, captured by this run before deploy-production so
-          # that failures between service start and the monitor's first tick are
-          # attributed to the deploy. The monitor stamps started_at when the
-          # deploy succeeds. There is NO fallback: an hourly monitor cannot take a
-          # pre-deployment reading after the fact, so if either dashboard cannot
-          # be read (three attempts) this job fails and nothing deploys.
-          import time, urllib.request
-          readings = {}
-          for name, base in (("vllm_omni", "http://review.43.155.186.30.nip.io/code_review/vllm_omni"),
-                             ("vllm_gr", "http://review.43.155.186.30.nip.io/code_review/vllm_gr")):
-              last = None
-              for attempt in range(3):
-                  try:
-                      with urllib.request.urlopen(base + "/api/status", timeout=90) as resp:
-                          payload = json.loads(resp.read().decode("utf-8"))
-                      if not isinstance(payload, dict) or "jobs" not in payload or "history" not in payload:
-                          raise ValueError("malformed status payload")
-                      readings[name] = payload
-                      break
-                  except Exception as exc:  # noqa: BLE001
-                      last = exc
-                      time.sleep(30)
-              if name not in readings:
-                  print(f"pre-deploy baseline unavailable for {name}: {last}; refusing to deploy without one", file=sys.stderr)
-                  sys.exit(1)
-          if True:
-              primary = readings["vllm_omni"]
-              days = (primary.get("history") or {}).get("days") or []
-              done = days[:-1] if len(days) > 1 else days
-              attention = [int(d.get("attention") or 0) for d in done]
-              gate = [int(d.get("gate_failures") or 0) for d in done]
-              baseline = {
-                  "mean_attention": (sum(attention) / len(attention)) if attention else 0.0,
-                  "max_attention": max(attention) if attention else 0,
-                  "mean_gate_failures": (sum(gate) / len(gate)) if gate else 0.0,
-                  "counts_failed": sum(int((r.get("counts") or {}).get("failed") or 0) for r in readings.values()),
-                  "review_failed": sum(int(((r.get("review_stats") or {}).get("outcomes") or {}).get("failed") or 0)
-                                       for r in readings.values()),
-                  "gate_failures": sum(int((r.get("review_stats") or {}).get("gate_failures") or 0) for r in readings.values()),
-                  "split_failed": sum(int(((r.get("split") or {}).get("attempts") or {}).get("failed") or 0)
-                                      for r in readings.values()),
-                  "last_scan_at": (primary.get("metadata") or {}).get("last_scan_at"),
-                  "started_at": "",
-                  "captured_at": datetime.now(timezone.utc).isoformat(),
-                  "max_job_ids": {name: max((int(j.get("id") or 0) for j in r.get("jobs") or []), default=0)
-                                  for name, r in readings.items()},
-              }
-          record = {"repo": repo, "merge_sha": merge_sha, "pre_merge_sha": pre, "pr_number": pr_number,
-                    "deploy_run_id": run_id, "run_attempt": run_attempt,
-                    "opened_at": datetime.now(timezone.utc).isoformat(),
-                    "kind": "rb", "status": "pending", "baseline": baseline, "pusher": pusher}
-          body = "\n".join([
-              f"Deploy of `{merge_sha}` (previous `{pre}`), run {os.environ['GITHUB_SERVER_URL']}/{repo}/actions/runs/{run_id}",
-              f"PR: #{pr_number}" if pr_number else "PR: (direct push)",
-              "",
-              "The monitor appends one tick comment per hour and closes this issue when the window passes.",
-              "",
-              f"<!-- omni-maintainer:canary:v1 {json.dumps(record, sort_keys=True)} -->",
-          ])
-          payload = json.dumps({"title": f"[canary] deploy {merge_sha[:8]}", "body": body, "labels": [label]})
-          out = gh("api", f"repos/{repo}/issues", "-X", "POST", "--input", "-", stdin=payload)
-          print("canary recorded:", json.loads(out)["html_url"])
-          PY
+  # deploy-production: add `canary-record` to `needs`, the predicate above,
+  # `permissions: { contents: read, issues: write, pull-requests: read, actions: read }`
+  # and these as its FIRST two steps (the job currently only downloads the
+  # artifact, so the script must be checked out first; the self-hosted
+  # runner has python3 and gh):
+  #
+  #     - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+  #       with:
+  #         persist-credentials: false
+  #         sparse-checkout: deploy/canary_guard.py
+  #         sparse-checkout-cone-mode: false
+  #     - name: deploy-guard (everything live, seconds before deploying)
+  #       env:
+  #         GH_TOKEN: ${{ github.token }}
+  #         GITHUB_EVENT_BEFORE: ${{ github.event.before }}
+  #         GITHUB_HEAD_MESSAGE: ${{ github.event.head_commit.message }}
+  #         HUMANS: "tzhouam"
+  #       run: python3 deploy/canary_guard.py guard

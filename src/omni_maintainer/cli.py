@@ -141,9 +141,26 @@ def _deployed_successfully(gh: Gh, repo: str, workflow_file: str, sha: str) -> b
     return False
 
 
-def _bar_inputs(gh: Gh, policy: dict[str, Any], snapshot: PullSnapshot, workdir: str | None) -> tuple[BarInputs, Preflight]:
-    pre = run_preflight(gh, policy, now=_now())
+def _bar_inputs(gh: Gh, policy: dict[str, Any], snapshot: PullSnapshot, workdir: str | None,
+                *, enforce_caps: bool = True) -> tuple[BarInputs, Preflight | None]:
+    """Bar inputs. The global facts (pause, caps, holds) come from preflight.
+
+    The arbiter (``enforce_caps=True``) fails closed when they cannot be
+    read. The published check is PR-local by design, so when preflight is
+    unavailable it proceeds with the global facts marked unknown and says
+    so in a note: an unreadable ledger must not lock humans out of their
+    own merges.
+    """
+    try:
+        pre: Preflight | None = run_preflight(gh, policy, now=_now())
+    except PreflightError:
+        if enforce_caps:
+            raise
+        pre = None
     empty, tip_ok = _revert_facts(gh, policy, snapshot, workdir, repo_config(policy, snapshot.repo))
+    if pre is None:
+        return BarInputs(now=_now(), merges_today=0, paused=False, deploy_hold=False, open_canary=False,
+                         revert_verified_empty=empty, base_tip_is_reverted_merge=tip_ok), None
     return BarInputs(now=pre.now, merges_today=pre.merges_today, paused=pre.paused,
                      deploy_hold=pre.deploy_hold, open_canary=pre.open_canary,
                      revert_verified_empty=empty, base_tip_is_reverted_merge=tip_ok), pre
@@ -159,29 +176,58 @@ def cmd_gate_evaluate(args: argparse.Namespace, policy: dict[str, Any], gh: Gh) 
         except GhError as exc:
             _emit({"ok": False, "publish_error": str(exc), "summary": "could not publish the pending check"})
             return EXIT_CRASH
-    try:
-        snapshot = _load_pull(gh, policy, args.repo, args.pr)
-        inputs, _ = _bar_inputs(gh, policy, snapshot, args.workdir)
-    except (IncompleteRead, PreflightError, GhError) as exc:
-        # Fail closed: publish a failing check that names the read problem.
-        # If even that cannot be published, the job must fail (EXIT_CRASH):
-        # an earlier successful check on the same head would otherwise keep
-        # standing while a new objection or hold goes unrecorded.
+    # The head we publish failures on: the caller's, until we have read the
+    # real one. A failing check is only worth publishing on a head that has
+    # a pending run from this evaluation; otherwise the job must crash.
+    pending_head = str(getattr(args, "head", "") or "").lower() if args.publish else ""
+
+    def fail_closed(exc: Exception) -> int:
+        # Publish a failing check naming the read problem on the head that
+        # carries this evaluation's pending run. If even that cannot be
+        # published, the job fails (EXIT_CRASH): an earlier success would
+        # otherwise stand while a new objection or hold goes unrecorded.
         from .gate.bar import BarResult
         result = BarResult(ok=False, failures=[f"gate could not read GitHub completely: {exc}"])
-        if args.publish and getattr(args, "head", ""):
+        if pending_head:
             try:
-                gate_merge.publish_check(gh, repo=args.repo, head_sha=args.head, result=result)
+                gate_merge.publish_check(gh, repo=args.repo, head_sha=pending_head, result=result)
             except GhError as publish_exc:
                 _emit({"ok": False, "summary": result.summary(), "publish_error": str(publish_exc)})
                 return EXIT_CRASH
             _emit({"ok": False, "summary": result.summary()})
             return EXIT_FAIL
-        _emit({"ok": False, "summary": result.summary()})
+        _emit({"ok": False, "summary": result.summary(),
+               **({"publish_error": str(exc)} if isinstance(exc, GhError) else {})})
         return EXIT_CRASH
+
+    try:
+        snapshot = _load_pull(gh, policy, args.repo, args.pr)
+    except (IncompleteRead, GhError) as exc:
+        return fail_closed(exc)
+    if args.publish and snapshot.head_sha != pending_head:
+        # The head moved between the caller's read and ours: the pending run
+        # went to the old head, so the actual head gets one too. If that
+        # publish fails there is no trustworthy check on the real head, and
+        # publishing a failure on the stale head would not change that:
+        # the job must crash.
+        try:
+            gate_merge.publish_pending(gh, repo=args.repo, head_sha=snapshot.head_sha,
+                                       details_url=args.details_url or "")
+        except GhError as exc:
+            _emit({"ok": False, "publish_error": str(exc), "head": snapshot.head_sha,
+                   "summary": "head moved and the pending check for the new head could not be published"})
+            return EXIT_CRASH
+        pending_head = snapshot.head_sha
+    try:
+        inputs, pre = _bar_inputs(gh, policy, snapshot, args.workdir, enforce_caps=args.enforce_caps)
+    except (IncompleteRead, PreflightError, GhError) as exc:
+        return fail_closed(exc)
     # The published check states the PR's own properties; caps and holds
     # apply to autonomous merges and are reported as notes here.
     result = evaluate(snapshot, policy=policy, repo=repo, inputs=inputs, enforce_caps=args.enforce_caps)
+    if pre is None:
+        result.notes.append("global state (pause, caps, holds) unreadable; the published check is PR-local, "
+                            "the arbiter will not merge until it can read it")
     if args.publish:
         try:
             gate_merge.publish_check(gh, repo=args.repo, head_sha=snapshot.head_sha, result=result,

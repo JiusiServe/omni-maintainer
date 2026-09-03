@@ -221,6 +221,10 @@ def evaluate(snapshot: PullSnapshot, *, policy: dict[str, Any], repo: RepoConfig
         result.failures.append(f"GitHub reports mergeable={snapshot.mergeable!r} ({snapshot.mergeable_state})")
     elif snapshot.mergeable_state == "dirty":
         result.failures.append("merge conflicts (mergeable_state=dirty)")
+    elif snapshot.mergeable_state == "behind":
+        # Approval, CI and the reviewer verdict were all produced against the
+        # base as it was; once main advances they describe a different merge.
+        result.failures.append("branch is behind main (mergeable_state=behind); update it so review and CI cover the actual merge")
 
     # Hard exclusions: never merged by automation, go label or not. The
     # knowledge plane and adapter manifests are human-promoted by invariant.

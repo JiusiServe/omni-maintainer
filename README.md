@@ -88,9 +88,9 @@ removing the label changes nothing. Set the repository variable
 ```
 src/omni_maintainer/policy.json          thresholds, caps, carve-outs, labels, identities, phase flags (human-gated)
 prompts/                    self-contained prompts for the probe, monitor and maintain routines
-workflows/                  templates: maintainer-gate.yml (IMC and here), maintainer-gate-rb.yml (the
-                            omni-reviewbot gate, run from here on a schedule), maintainer-merge.yml (here),
-                            deploy-canary-job.yml (fragment for omni-reviewbot deploy.yml)
+workflows/                  templates: maintainer-gate.yml (for InferMatrixCopilot), deploy-canary-job.yml
+                            (fragment for omni-reviewbot deploy.yml) and rb-canary-guard.py (its script,
+                            copied to omni-reviewbot deploy/canary_guard.py)
 src/omni_maintainer/gate    reads, actors, verdict, bar, caps, merge
 src/omni_maintainer/monitor dashboard, fingerprint, canary, rollback, pushes, issues
 src/omni_maintainer/routine preflight, workqueue, release, ledger, ghcli

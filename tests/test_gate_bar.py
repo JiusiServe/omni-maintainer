@@ -136,6 +136,10 @@ def test_passes_when_everything_holds(pr84, policy, now):
     snap = _seen(_approved(_clean(pr84), seen), seen)
     result = evaluate(snap, policy=policy, repo=repo_config(policy, IMC), inputs=_inputs(now))
     assert result.ok, result.failures
+    # once main advances, the same approval no longer describes the actual merge
+    behind = replace(snap, mergeable_state="behind")
+    result = evaluate(behind, policy=policy, repo=repo_config(policy, IMC), inputs=_inputs(now))
+    assert any("behind main" in f for f in result.failures)
 
 
 def test_revise_verdict_and_forged_marker(pr84, policy, now):
