@@ -32,7 +32,22 @@
       "tier": "A",
       "deploys": false,
       "required_checks": ["suite"],
-      "optional_checks": ["audit"],
+      "optional_checks": [],
+      "path_checks": [
+        {
+          "name": "audit",
+          "paths": [
+            ".github/workflows/vllm-omni-release-audit.yml",
+            "adapters/vllm_omni/manifest.yaml",
+            "adapters/vllm_omni/release_baseline.yaml",
+            "doc/contributing/release-maintenance.md",
+            "plugins/infermatrix-copilot/skills/imupdate/**",
+            "knowledge/repos/vllm-omni/**",
+            "tools/audit_vllm_omni_release.py",
+            "tools/vllm_omni_release_audit.py"
+          ]
+        }
+      ],
       "ci_workflow_name": "tests"
     },
     "JiusiServe/omni-maintainer": {
@@ -98,7 +113,8 @@
       "JiusiServe/omni-reviewbot": ["deploy/provider-release-sha"]
     },
     "pyproject_dependency_pattern": "^[+-]\\s*(dependencies|\"infermatrix-copilot)",
-    "never_merge_head_branches": ["knowledge/intake-*"]
+    "never_merge_head_branches": ["knowledge/intake-*"],
+    "never_merge_paths": ["knowledge/**", "adapters/*/manifest.yaml"]
   },
   "stale": {
     "label_after_days": 14,

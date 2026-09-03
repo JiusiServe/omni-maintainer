@@ -71,6 +71,23 @@ class Transition:
     hold: bool = True
 
 
+def healthy_tick_streak(ticks: list[Any]) -> int:
+    """Consecutive trailing ticks with both dashboards up, watchers alive and
+    no failed jobs since the revert deploy. ``ticks`` are ``TickView``s in
+    chronological order."""
+    streak = 0
+    for tick in reversed(ticks):
+        healthy = (
+            not any(tick.down.values())
+            and not any(tick.watcher_dead.values())
+            and tick.failed_jobs_total == 0
+        )
+        if not healthy:
+            break
+        streak += 1
+    return streak
+
+
 def current_state(labels: list[str] | tuple[str, ...]) -> str | None:
     present = [label for label in labels if label in STATES]
     if not present:

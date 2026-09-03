@@ -151,13 +151,14 @@ jobs:
           rc=0
           # A failing bar is a failing CHECK, not a failing job; only a crash
           # of the evaluator itself (rc >= 2) fails this job, and the ruleset
-          # then blocks the merge because the check is missing.
+          # then blocks the merge because the check is missing. The `|| code=$?`
+          # form keeps the sweep going under the runner's `bash -e`.
           for pr in $NUMBERS; do
-            head=$(gh pr view "$pr" -R "$GITHUB_REPOSITORY" --json headRefOid -q .headRefOid)
+            head=$(gh pr view "$pr" -R "$GITHUB_REPOSITORY" --json headRefOid -q .headRefOid) || { rc=2; continue; }
+            code=0
             python -m omni_maintainer gate evaluate --repo "$GITHUB_REPOSITORY" --pr "$pr" --head "$head" \
               --workdir work --publish \
-              --details-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-            code=$?
+              --details-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" || code=$?
             if [ "$code" -ge 2 ]; then rc=$code; fi
           done
           exit $rc

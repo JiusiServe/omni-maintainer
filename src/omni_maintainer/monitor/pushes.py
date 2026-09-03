@@ -1,27 +1,37 @@
 """Classify commits that reached a protected-by-policy ``main``.
 
 On the private reviewbot repository nothing prevents a direct push, so the
-monitor looks at every new commit on ``main`` and names what it was. A PR
-merge by a human is the expected shape; a direct push by an app, a bot, or
-an unattributed author is treated as an incident.
+monitor looks at every new commit on ``main`` and names what it was.
+
+Attribution rules, all server-side facts:
+
+- A commit is a pull-request merge only when GitHub's own record of that
+  pull request says it merged **and** its ``merge_commit_sha`` is this
+  commit. A merge message and two parents are trivially forged by whoever
+  pushes; the PR record is not.
+- Commit author and committer metadata are never used to excuse a push.
+- A direct push is an incident unless the deploy run's canary record,
+  written by GitHub Actions with the server-stamped ``github.actor`` of that
+  push, names an allowlisted human as the pusher.
 """
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 _MERGE_MESSAGE = re.compile(r"^Merge pull request #(?P<number>\d+)\b")
-_SQUASH_SUFFIX = re.compile(r"\(#(?P<number>\d+)\)\s*$")
 
-PR_MERGE_HUMAN = "pr_merge_human"
-PR_MERGE_BOT = "pr_merge_bot"
-DIRECT_HUMAN = "direct_push_human"
-DIRECT_BOT = "direct_push_bot"
+PR_MERGE = "pr_merge"
+DIRECT_HUMAN = "direct_push_human"          # pusher proven by a server-stamped canary record
 DIRECT_UNATTRIBUTED = "direct_push_unattributed"
+FORGED_MERGE = "forged_merge_message"       # claims a PR merge GitHub does not confirm
 
-INCIDENT_KINDS = frozenset({DIRECT_BOT, DIRECT_UNATTRIBUTED})
+INCIDENT_KINDS = frozenset({DIRECT_UNATTRIBUTED, FORGED_MERGE})
+
+# pr_number -> merge_commit_sha of that PR when GitHub reports it merged, else None
+MergeLookup = Callable[[int], "str | None"]
 
 
 @dataclass(frozen=True)
@@ -29,38 +39,31 @@ class CommitClass:
     sha: str
     kind: str
     pr_number: int | None
-    author_login: str
-    author_type: str
+    pusher: str          # from the canary record when known, else ""
     message: str
 
 
-def classify_commit(commit: dict[str, Any], *, bot_logins: Iterable[str] = ()) -> CommitClass:
+def classify_commit(commit: dict[str, Any], *, merged_pr_sha: MergeLookup,
+                    pushers: dict[str, str] | None = None, humans: Iterable[str] = ()) -> CommitClass:
+    """``merged_pr_sha(n)`` must answer from GitHub's pull-request record.
+
+    ``pushers`` maps merge_sha → server-stamped pusher login (from canary records).
+    """
     sha = str(commit.get("sha") or "")
     message = str(((commit.get("commit") or {}).get("message")) or "")
     first = message.splitlines()[0] if message else ""
     parents = commit.get("parents") or []
-    author = commit.get("author") or {}
-    login = str(author.get("login") or "")
-    author_type = str(author.get("type") or "")
-    bots = set(bot_logins)
-    is_bot = author_type == "Bot" or login in bots or login.endswith("[bot]")
-    pr_number: int | None = None
+    pusher = (pushers or {}).get(sha, "")
     match = _MERGE_MESSAGE.match(first)
     if match and len(parents) >= 2:
-        pr_number = int(match.group("number"))
-    else:
-        squash = _SQUASH_SUFFIX.search(first)
-        if squash and len(parents) == 1:
-            pr_number = int(squash.group("number"))
-    if pr_number is not None:
-        kind = PR_MERGE_BOT if is_bot else PR_MERGE_HUMAN
-    elif not login:
-        kind = DIRECT_UNATTRIBUTED
-    elif is_bot:
-        kind = DIRECT_BOT
-    else:
-        kind = DIRECT_HUMAN
-    return CommitClass(sha, kind, pr_number, login, author_type, first[:120])
+        number = int(match.group("number"))
+        recorded = merged_pr_sha(number)
+        if recorded and recorded.lower() == sha.lower():
+            return CommitClass(sha, PR_MERGE, number, pusher, first[:120])
+        return CommitClass(sha, FORGED_MERGE, number, pusher, first[:120])
+    if pusher and pusher in set(humans):
+        return CommitClass(sha, DIRECT_HUMAN, None, pusher, first[:120])
+    return CommitClass(sha, DIRECT_UNATTRIBUTED, None, pusher, first[:120])
 
 
 def new_commits_since(commits: list[dict[str, Any]], *, last_seen_sha: str) -> list[dict[str, Any]]:

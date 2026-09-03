@@ -9,8 +9,8 @@ from omni_maintainer.monitor import canary, rollback
 from omni_maintainer.monitor.dashboard import Fetch, digest, job_time, new_failed_jobs, watcher_dead, window_saturated
 from omni_maintainer.monitor.fingerprint import classify, excerpt, fingerprint, normalize
 from omni_maintainer.monitor.issues import CREDENTIAL_PATTERNS, UnsafeText, credential_reason, ensure_safe, render_failure_body
-from omni_maintainer.monitor.pushes import (DIRECT_HUMAN, DIRECT_UNATTRIBUTED, PR_MERGE_HUMAN, classify_commit,
-                                            new_commits_since)
+from omni_maintainer.monitor.pushes import (DIRECT_HUMAN, DIRECT_UNATTRIBUTED, FORGED_MERGE, INCIDENT_KINDS, PR_MERGE,
+                                            classify_commit, new_commits_since)
 from conftest import load
 
 from dataclasses import replace
@@ -104,8 +104,18 @@ def test_canary_lifecycle_start_trip_close(policy):
     assert canary.evaluate(record, [running], now=NOW, policy=policy).action == canary.WAIT
     failed = view(canary.Tick(NOW, digests, "completed", "failure", 0, 0))
     assert canary.evaluate(record, [failed], now=NOW, policy=policy).action == canary.DEPLOY_FAILED
+    # any other terminal conclusion is a hold, never an assumed restoration
+    for conclusion in ("cancelled", "timed_out", "skipped", None):
+        odd = view(canary.Tick(NOW, digests, "completed", conclusion, 0, 0))
+        d = canary.evaluate(record, [odd], now=NOW, policy=policy)
+        assert d.action == canary.HOLD and d.details["rule"] == "deploy_incomplete"
     ok = view(canary.Tick(NOW, digests, "completed", "success", 0, 0))
     assert canary.evaluate(record, [ok], now=NOW, policy=policy).action == canary.START
+    # the record carries the server-stamped pusher through the marker
+    stamped = canary.CanaryRecord.parse(canary.CanaryRecord(
+        repo="r", merge_sha="a" * 40, pre_merge_sha="b" * 40, pr_number=None, deploy_run_id=1,
+        opened_at=NOW.isoformat(), pusher="tzhouam").to_marker())
+    assert stamped.pusher == "tzhouam"
 
     record.baseline = canary.baseline_from(digests, started_at=NOW)
     assert record.baseline.gate_failures == 3 and record.baseline.review_failed == 8
@@ -204,13 +214,41 @@ def test_rollback_state_machine(policy):
     assert rollback.current_state(["x", rollback.PENDING, rollback.MERGED]) == rollback.MERGED
 
 
-def test_push_classification_on_real_commits():
+def test_healthy_tick_streak_counts_trailing_clean_ticks():
+    digests = _digests()
+    down = {**digests, "vllm_gr": digest("vllm_gr", Fetch(False, 90, None, "timeout"), now=NOW)}
+
+    def view(at, d, failed=0):
+        return canary.TickView.parse(canary.Tick(at, _fresh(d, at), "completed", "success", 1, failed).to_marker(),
+                                     watcher_multiplier=3)
+
+    h = [NOW + timedelta(hours=i) for i in range(4)]
+    assert rollback.healthy_tick_streak([]) == 0
+    assert rollback.healthy_tick_streak([view(h[0], digests), view(h[1], digests)]) == 2
+    assert rollback.healthy_tick_streak([view(h[0], digests), view(h[1], down), view(h[2], digests)]) == 1
+    assert rollback.healthy_tick_streak([view(h[0], digests), view(h[1], digests, failed=1)]) == 0
+
+
+def test_push_classification_uses_server_side_facts_only():
     commits = load("imc_main_commits.json")
-    kinds = {c["sha"][:7]: classify_commit(c).kind for c in commits}
-    assert kinds["c4f96aa"] == PR_MERGE_HUMAN
-    assert kinds["cbe4d68"] == DIRECT_UNATTRIBUTED   # human push from an unlinked email
-    assert kinds["229ded5"] == DIRECT_HUMAN
-    assert classify_commit(commits[1]).pr_number == 115
+    merge_115 = load("pr115_merged_pull.json")  # GitHub's record: merged, merge_commit_sha = c4f96aa…
+    assert merge_115["merged"] and merge_115["merge_commit_sha"].startswith("c4f96aa")
+    lookup = lambda n: merge_115["merge_commit_sha"] if n == 115 else None  # noqa: E731
+    kinds = {c["sha"][:7]: classify_commit(c, merged_pr_sha=lookup).kind for c in commits}
+    assert kinds["c4f96aa"] == PR_MERGE
+    # a direct push is an incident whatever its commit metadata says...
+    assert kinds["cbe4d68"] == DIRECT_UNATTRIBUTED and kinds["229ded5"] == DIRECT_UNATTRIBUTED
+    # ...unless the deploy run's canary record names an allowlisted human as github.actor
+    sha = next(c["sha"] for c in commits if c["sha"].startswith("229ded5"))
+    direct = next(c for c in commits if c["sha"] == sha)
+    assert classify_commit(direct, merged_pr_sha=lookup, pushers={sha: "tzhouam"}, humans=["tzhouam"]).kind == DIRECT_HUMAN
+    assert classify_commit(direct, merged_pr_sha=lookup, pushers={sha: "someone"}, humans=["tzhouam"]).kind == DIRECT_UNATTRIBUTED
+    assert classify_commit(commits[1], merged_pr_sha=lookup).pr_number == 115
+    # a forged merge message with two parents is an incident when GitHub's PR record disagrees
+    forged = {**commits[1], "sha": "f" * 40}
+    assert classify_commit(forged, merged_pr_sha=lookup).kind == FORGED_MERGE
+    assert classify_commit(commits[1], merged_pr_sha=lambda n: None).kind == FORGED_MERGE
+    assert FORGED_MERGE in INCIDENT_KINDS
     fresh = new_commits_since(commits, last_seen_sha=commits[2]["sha"])
     assert [c["sha"][:7] for c in fresh] == ["c4f96aa", "cbe4d68"]
     assert new_commits_since(commits, last_seen_sha=commits[0]["sha"]) == []

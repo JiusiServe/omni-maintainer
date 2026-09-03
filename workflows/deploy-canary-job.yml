@@ -42,6 +42,18 @@ jobs:
       issues: write
       pull-requests: read
     steps:
+      - name: Refuse a stale run (main must still be at this commit; re-runs after main advanced deploy nothing)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MERGE_SHA: ${{ github.sha }}
+        run: |
+          tip=$(gh api "repos/${GITHUB_REPOSITORY}/branches/main" -q .commit.sha)
+          if [ "$tip" != "$MERGE_SHA" ]; then
+            echo "main is at $tip, this run is for $MERGE_SHA: stale run, refusing to record or deploy" >&2
+            exit 1
+          fi
+          echo "main is still at $MERGE_SHA"
+
       - name: Refuse to deploy while a canary window, incident or rollback is open (rollback excepted)
         env:
           GH_TOKEN: ${{ github.token }}
@@ -105,6 +117,9 @@ jobs:
           PRE_MERGE_SHA: ${{ github.event.before }}
           RUN_ID: ${{ github.run_id }}
           HEAD_MESSAGE: ${{ github.event.head_commit.message }}
+          # Server-stamped identity of whoever pushed: the only push
+          # attribution the monitor trusts (commit metadata is spoofable).
+          PUSHER: ${{ github.actor }}
         run: |
           python3 - <<'PY'
           import json, os, re, subprocess, sys
@@ -115,6 +130,7 @@ jobs:
           pre = os.environ.get("PRE_MERGE_SHA") or ""
           run_id = int(os.environ["RUN_ID"])
           message = os.environ.get("HEAD_MESSAGE") or ""
+          pusher = os.environ.get("PUSHER") or ""
           pr = re.match(r"^Merge pull request #(\d+)", message)
           pr_number = int(pr.group(1)) if pr else None
           label = "maintainer:canary"
@@ -132,7 +148,7 @@ jobs:
 
           record = {"repo": repo, "merge_sha": merge_sha, "pre_merge_sha": pre, "pr_number": pr_number,
                     "deploy_run_id": run_id, "opened_at": datetime.now(timezone.utc).isoformat(),
-                    "kind": "rb", "status": "pending", "baseline": None}
+                    "kind": "rb", "status": "pending", "baseline": None, "pusher": pusher}
           body = "\n".join([
               f"Deploy of `{merge_sha}` (previous `{pre}`), run {os.environ['GITHUB_SERVER_URL']}/{repo}/actions/runs/{run_id}",
               f"PR: #{pr_number}" if pr_number else "PR: (direct push)",

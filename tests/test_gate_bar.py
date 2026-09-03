@@ -193,6 +193,23 @@ def test_required_check_states(pr84, policy, now):
     assert any("fork PR" in f for f in evaluate(fork, policy=policy, repo=repo, inputs=_inputs(at)).failures)
 
 
+def test_path_conditional_audit_check(pr84, policy, now):
+    seen = now - timedelta(hours=25)
+    repo = repo_config(policy, IMC)
+    base = _seen(_approved(_clean(pr84), seen), seen)
+    # PR #84 touches installer files only: audit is not required and its absence is fine
+    assert evaluate(base, policy=policy, repo=repo, inputs=_inputs(now)).ok
+    touching = replace(base, files=base.files + (FileChange("tools/audit_vllm_omni_release.py", "modified", 1, 1, "+x"),))
+    result = evaluate(touching, policy=policy, repo=repo, inputs=_inputs(now))
+    assert any("'audit' is required by changed paths" in f and "is missing" in f for f in result.failures)
+    cancelled = replace(touching, check_runs=touching.check_runs + (
+        CheckRun("audit", "completed", "cancelled", "github-actions", touching.head_sha),))
+    assert any("'audit' is required" in f for f in evaluate(cancelled, policy=policy, repo=repo, inputs=_inputs(now)).failures)
+    green = replace(touching, check_runs=touching.check_runs + (
+        CheckRun("audit", "completed", "success", "github-actions", touching.head_sha),))
+    assert evaluate(green, policy=policy, repo=repo, inputs=_inputs(now)).ok
+
+
 def test_revert_fast_path_requires_both_proofs(pr84, policy, now):
     snap = replace(_clean(pr84), labels=("maintainer:rollback",), created_at=now, last_commit_at=now)
     repo = repo_config(policy, IMC)
@@ -225,6 +242,15 @@ def test_human_only_repo_and_never_merge_branches(pr84, policy, now):
     intake = replace(_seen(_approved(_clean(pr84), seen), seen), head_ref="knowledge/intake-2026-09-03")
     result = evaluate(intake, policy=policy, repo=repo_config(policy, IMC), inputs=_inputs(now))
     assert any("never merged" in f for f in result.failures)
+    # knowledge and adapter manifests are hard exclusions: a human go does not help
+    manifest = replace(_seen(_approved(_clean(pr84), seen), seen),
+                       files=(FileChange("adapters/vllm_omni/manifest.yaml", "modified", 1, 1, "+x"),),
+                       labels=("maintainer-go",), timeline=(
+                           {"event": "labeled", "label": {"name": "maintainer-go"},
+                            "actor": {"login": "tzhouam", "type": "User"},
+                            "created_at": (seen + timedelta(minutes=1)).isoformat()},))
+    result = evaluate(manifest, policy=policy, repo=repo_config(policy, IMC), inputs=_inputs(now))
+    assert any("human promotion only" in f for f in result.failures)
 
 
 def test_size_limits(pr84, policy, now):

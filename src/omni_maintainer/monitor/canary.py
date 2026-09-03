@@ -81,6 +81,8 @@ class CanaryRecord:
     kind: str = "rb"
     baseline: Baseline | None = None
     status: str = "pending"  # pending | running | closed
+    # github.actor of the push, stamped by the deploy workflow itself.
+    pusher: str = ""
 
     def to_marker(self) -> str:
         payload = {
@@ -88,6 +90,7 @@ class CanaryRecord:
             "pr_number": self.pr_number, "deploy_run_id": self.deploy_run_id,
             "opened_at": self.opened_at, "kind": self.kind, "status": self.status,
             "baseline": self.baseline.to_json() if self.baseline else None,
+            "pusher": self.pusher,
         }
         return f"<!-- {RECORD_MARKER} {json.dumps(payload, sort_keys=True)} -->"
 
@@ -111,6 +114,7 @@ class CanaryRecord:
             kind=str(data.get("kind") or "rb"),
             baseline=Baseline.from_json(baseline) if isinstance(baseline, dict) else None,
             status=str(data.get("status") or "pending"),
+            pusher=str(data.get("pusher") or ""),
         )
 
 
@@ -252,8 +256,17 @@ def evaluate(record: CanaryRecord, ticks: list[TickView], *, now: datetime,
         if current.deploy_status == "completed":
             if current.deploy_conclusion == "success":
                 return Decision(START, "deploy run succeeded; window starts")
-            return Decision(DEPLOY_FAILED,
-                            f"deploy run concluded {current.deploy_conclusion!r}; the host already rolled back")
+            if current.deploy_conclusion == "failure":
+                # server-deploy.sh restores the previous release on its own
+                # failure path; that is the only conclusion with that evidence.
+                return Decision(DEPLOY_FAILED, "deploy run failed; the host's own rollback path ran",
+                                {"rule": "deploy_failed", "conclusion": "failure"})
+            # cancelled, timed_out, skipped, neutral, or a job that never ran:
+            # the host may be in either release. Hold for a human; never
+            # assume a restoration nobody observed.
+            return Decision(HOLD, f"deploy run ended {current.deploy_conclusion!r} without a success or failure "
+                                  "conclusion; production state unverified",
+                            {"rule": "deploy_incomplete", "conclusion": current.deploy_conclusion})
         opened = parse_time(record.opened_at)
         if current.deploy_status == "waiting" and opened is not None and \
                 now - opened > timedelta(hours=float(c["deploy_waiting_hold_hours"])):

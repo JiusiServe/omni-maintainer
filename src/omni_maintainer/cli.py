@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -309,7 +310,7 @@ def cmd_monitor_tick(args: argparse.Namespace, policy: dict[str, Any], gh: Gh) -
     cursors, ledger_body = _read_cursors(gh, policy, args.state_file)
     digests = _fetch_digests(policy, now)
     decisions: dict[str, Any] = {"at": now.isoformat(), "instances": {}, "failures": [], "canaries": [],
-                                 "pushes": [], "signals": [], "pending_acks": [], "notes": []}
+                                 "rollbacks": [], "pushes": [], "signals": [], "pending_acks": [], "notes": []}
     if phase_note:
         decisions["notes"].append(phase_note)
     for name, d in digests.items():
@@ -354,6 +355,7 @@ def cmd_monitor_tick(args: argparse.Namespace, policy: dict[str, Any], gh: Gh) -
 
     # Direct pushes on the reviewbot main branch.
     rb = policy["ledger"]["repo"]
+    labels = policy["labels"]
     try:
         commits = gh.api(f"repos/{rb}/commits?sha=main&per_page=50")
     except GhError as exc:
@@ -361,13 +363,28 @@ def cmd_monitor_tick(args: argparse.Namespace, policy: dict[str, Any], gh: Gh) -
         commits = []
     last_seen = str(cursors.get("rb_main_sha") or "")
     fresh = new_commits_since(commits or [], last_seen_sha=last_seen) if last_seen else []
-    bots = set(policy["identities"].get("gate_merger_logins") or ()) | {policy["identities"].get("routine_login") or ""}
+    # Server-stamped pushers: the deploy run's canary record carries
+    # github.actor for its push. Commit metadata is never used for this.
+    pushers: dict[str, str] = {}
+    if fresh:
+        for issue in gh.api(f"repos/{rb}/issues?labels={labels['canary']}&state=all&per_page=100", paginate=True) or []:
+            rec = canary_mod.CanaryRecord.parse(str(issue.get("body") or ""))
+            if rec and rec.pusher:
+                pushers[rec.merge_sha] = rec.pusher
+    def merged_pr_sha(number: int) -> str | None:
+        try:
+            pull = gh.api(f"repos/{rb}/pulls/{number}")
+        except GhError:
+            return None
+        return str(pull.get("merge_commit_sha") or "") if pull.get("merged") else None
+
     incident_pushes = 0
     for commit in fresh:
-        cls = classify_commit(commit, bot_logins=bots)
+        cls = classify_commit(commit, merged_pr_sha=merged_pr_sha, pushers=pushers,
+                              humans=policy["identities"].get("humans") or ())
         is_incident = cls.kind in INCIDENT_KINDS
         incident_pushes += int(is_incident)
-        decisions["pushes"].append({"sha": cls.sha, "kind": cls.kind, "pr": cls.pr_number, "author": cls.author_login,
+        decisions["pushes"].append({"sha": cls.sha, "kind": cls.kind, "pr": cls.pr_number, "pusher": cls.pusher,
                                     "message": cls.message, "incident": is_incident,
                                     "ack": f"--rb-main-sha {cls.sha}" if is_incident else ""})
     # Same rule as job cursors: the main-branch cursor advances past an
@@ -378,7 +395,6 @@ def cmd_monitor_tick(args: argparse.Namespace, policy: dict[str, Any], gh: Gh) -
         decisions["pending_acks"].append({"rb_main_sha": str(commits[0].get("sha") or "")})
 
     # Canaries.
-    labels = policy["labels"]
     canaries = gh.api(f"repos/{rb}/issues?labels={labels['canary']}&state=open&per_page=100", paginate=True)
     for issue in canaries or []:
         record = canary_mod.CanaryRecord.parse(str(issue.get("body") or ""))
@@ -417,6 +433,11 @@ def cmd_monitor_tick(args: argparse.Namespace, policy: dict[str, Any], gh: Gh) -
         if args.apply:
             _apply_canary(gh, policy, rb, int(issue["number"]), record, tick, decision, digests, now)
 
+    # Rollbacks: advance every open incident through its state machine so a
+    # tripped canary does not stay open forever and block the next deploy.
+    _advance_rollbacks(gh, policy, rb, now=now, apply=args.apply, trusted=_tick_authors(policy),
+                       decisions=decisions)
+
     if args.apply or args.state_file:
         _write_cursors(gh, policy, args.state_file, cursors, ledger_body, now)
     _emit(decisions)
@@ -436,19 +457,173 @@ def _apply_canary(gh: Gh, policy: dict[str, Any], repo: str, number: int, record
         add_labels(gh, repo=repo, number=number, labels=[f"canary:{decision.details.get('outcome', 'passed')}"])
         close_issue(gh, repo=repo, number=number, comment="canary window closed: " + decision.reason)
     elif decision.action in (canary_mod.TRIP, canary_mod.DEPLOY_FAILED, canary_mod.HOLD):
-        title = f"[incident] {decision.action} on deploy {record.merge_sha[:8]}"
+        title = f"[incident] {decision.details.get('rule', decision.action)} on deploy {record.merge_sha[:8]}"
         body = "\n".join([
             f"**Canary:** #{number} · **deploy:** `{record.merge_sha}` · **previous:** `{record.pre_merge_sha}`",
             f"**Rule:** {decision.details.get('rule', decision.action)} — {decision.reason}",
             "", "Evidence: see the tick comments on the canary issue.",
             "", "Rollback state advances through labels on this issue; evidence is never rewritten.",
-        ])
-        existing = find_issue_by_marker(gh, repo=repo, marker=f"canary #{number}", label=labels["incident"])
+        ] + ([
+            "", "**Production state is unverified.** A human must confirm which release the host runs "
+            "(`omni-reviewbot-host-admin status`) and close this incident, or roll back by hand.",
+        ] if decision.action == canary_mod.HOLD else []))
+        marker = f"<!-- canary #{number} -->"
+        existing = find_issue_by_marker(gh, repo=repo, marker=marker, label=labels["incident"])
         if existing is None:
-            ref = create_issue(gh, repo=repo, title=title, body=body + f"\n\n<!-- canary #{number} -->",
+            ref = create_issue(gh, repo=repo, title=title, body=body + f"\n\n{marker}",
                                labels=[labels["incident"], rollback_mod.PENDING] if decision.action == canary_mod.TRIP
                                else [labels["incident"]])
             comment_issue(gh, repo=repo, number=number, body=f"incident opened: {ref.url}")
+        if decision.action in (canary_mod.DEPLOY_FAILED, canary_mod.HOLD):
+            # The incident now carries the hold; the canary itself is
+            # finished, so it can never linger as an orphan that blocks the
+            # next deploy on its own.
+            add_labels(gh, repo=repo, number=number, labels=[f"canary:{decision.details.get('rule', decision.action)}"])
+            close_issue(gh, repo=repo, number=number, comment="canary closed: " + decision.reason)
+
+
+_CANARY_REF = re.compile(r"<!--\s*canary #(\d+)\s*-->")
+
+
+def _trusted_ticks(gh: Gh, repo: str, number: int, trusted: set[str], multiplier: float) -> list[canary_mod.TickView]:
+    comments = gh.api(f"repos/{repo}/issues/{number}/comments?per_page=100", paginate=True) or []
+    out = []
+    for c in comments:
+        if str((c.get("user") or {}).get("login") or "") not in trusted:
+            continue
+        view = canary_mod.TickView.parse(str(c.get("body") or ""), watcher_multiplier=multiplier)
+        if view:
+            out.append(view)
+    return out
+
+
+def _find_canary(gh: Gh, repo: str, label: str, *, pr_number: int | None = None,
+                 number: int | None = None) -> tuple[dict[str, Any], canary_mod.CanaryRecord] | None:
+    if number is not None:
+        issue = gh.api(f"repos/{repo}/issues/{number}")
+        record = canary_mod.CanaryRecord.parse(str(issue.get("body") or ""))
+        return (issue, record) if record else None
+    for issue in gh.api(f"repos/{repo}/issues?labels={label}&state=all&per_page=100", paginate=True) or []:
+        record = canary_mod.CanaryRecord.parse(str(issue.get("body") or ""))
+        if record and pr_number is not None and record.pr_number == pr_number:
+            return issue, record
+    return None
+
+
+def _advance_rollbacks(gh: Gh, policy: dict[str, Any], repo: str, *, now: datetime, apply: bool,
+                       trusted: set[str], decisions: dict[str, Any]) -> None:
+    """Walk every open incident through the rollback state machine (plan §5).
+
+    Facts come from GitHub only: the rollback marker a trusted identity wrote
+    on the incident, the revert PR's state, the revert push's own canary
+    record (its deploy run) and that canary's trusted tick comments.
+    """
+    labels = policy["labels"]
+    m = policy["monitor"]
+    incidents = gh.api(f"repos/{repo}/issues?labels={labels['incident']}&state=open&per_page=100", paginate=True) or []
+    for incident in incidents:
+        if "pull_request" in incident:
+            continue
+        number = int(incident["number"])
+        names = [str(l.get("name")) for l in incident.get("labels") or []]
+        state = rollback_mod.current_state(names)
+        if state is None:
+            continue
+        if state in rollback_mod.TERMINAL:
+            # Reconcile: a terminal label whose side effects did not all land
+            # (a close or a blocked issue) is retried here, idempotently.
+            if apply:
+                _before_terminal_label(gh, repo, incident, state, labels)
+                _after_terminal_label(gh, repo, incident, state)
+            continue
+        texts = []
+        if str((incident.get("user") or {}).get("login") or "") in trusted:
+            texts.append(str(incident.get("body") or ""))
+        comments = gh.api(f"repos/{repo}/issues/{number}/comments?per_page=100", paginate=True) or []
+        texts += [str(c.get("body") or "") for c in comments
+                  if str((c.get("user") or {}).get("login") or "") in trusted]
+        marker = next((mk for mk in (rollback_mod.parse_rollback_marker(t) for t in texts) if mk), None)
+        facts = rollback_mod.RollbackFacts(now=now)
+        if marker and marker.get("revert_pr"):
+            revert_pr = int(marker["revert_pr"])
+            pull = gh.api(f"repos/{repo}/pulls/{revert_pr}")
+            pr_state = "merged" if pull.get("merged") else ("closed" if pull.get("state") == "closed" else "open")
+            merged_at = parse_time(pull.get("merged_at"))
+            deploy_status, conclusion, healthy, succeeded_at = "", None, 0, None
+            if pr_state == "merged":
+                found = _find_canary(gh, repo, labels["canary"], pr_number=revert_pr)
+                if found:
+                    revert_canary, record = found
+                    deploy_status, conclusion = _deploy_run(gh, repo, record.deploy_run_id)
+                    if record.baseline is not None:
+                        succeeded_at = parse_time(record.baseline.started_at)
+                        healthy = rollback_mod.healthy_tick_streak(
+                            _trusted_ticks(gh, repo, int(revert_canary["number"]), trusted,
+                                           float(m["watcher_dead_multiplier"])))
+            facts = rollback_mod.RollbackFacts(
+                now=now, revert_pr_number=revert_pr, revert_pr_state=pr_state, revert_merged_at=merged_at,
+                revert_deploy_status=deploy_status, revert_deploy_conclusion=conclusion,
+                healthy_ticks=healthy, revert_deploy_succeeded_at=succeeded_at)
+        transition = rollback_mod.next_state(state, facts, policy=policy)
+        entry = {"incident": number, "from": state, "to": transition.state, "comment": transition.comment,
+                 "revert_pr": facts.revert_pr_number}
+        decisions["rollbacks"].append(entry)
+        if not apply or transition.state == state:
+            continue
+        # Retry-safe ordering. Every step is idempotent and the incident stays
+        # OPEN until its terminal label is persisted, so a failure anywhere
+        # leaves it where the next tick re-enters:
+        #   1. side effects that must exist before the state is final
+        #      (close the original canary, file the blocked issue)
+        #   2. the NEW state label, then the old one removed
+        #   3. only then, for recovered: close the incident itself
+        if transition.state in rollback_mod.TERMINAL:
+            _before_terminal_label(gh, repo, incident, transition.state, labels, comment=transition.comment)
+        add_labels(gh, repo=repo, number=number, labels=[transition.state])
+        remove_labels(gh, repo=repo, number=number,
+                      labels=[s for s in rollback_mod.STATES if s in names and s != transition.state])
+        comment_issue(gh, repo=repo, number=number,
+                      body=f"rollback: **{state} → {transition.state}** — {transition.comment}")
+        if transition.state in rollback_mod.TERMINAL:
+            _after_terminal_label(gh, repo, incident, transition.state)
+
+
+def _issue_is_open(gh: Gh, repo: str, number: int) -> bool:
+    return str(gh.api(f"repos/{repo}/issues/{number}").get("state") or "") == "open"
+
+
+def _before_terminal_label(gh: Gh, repo: str, incident: dict[str, Any], state: str, labels: dict[str, str],
+                           *, comment: str = "") -> None:
+    """Terminal side effects that must exist before the state label lands; idempotent."""
+    number = int(incident["number"])
+    if state == rollback_mod.RECOVERED:
+        ref = _CANARY_REF.search(str(incident.get("body") or ""))
+        if ref:
+            original = int(ref.group(1))
+            if _issue_is_open(gh, repo, original):
+                add_labels(gh, repo=repo, number=original, labels=["canary:rolled-back"])
+                close_issue(gh, repo=repo, number=original, comment=f"rolled back; see incident #{number}")
+    elif state == rollback_mod.FAILED:
+        marker = f"<!-- omni-maintainer:blocked:rollback #{number} -->"
+        if find_issue_by_marker(gh, repo=repo, marker=marker, label=labels["blocked"]) is None:
+            create_issue(gh, repo=repo, title=f"[blocked] rollback failed for incident #{number}",
+                         body="\n".join([
+                             f"The rollback for incident #{number} did not restore production: {comment or state}",
+                             "",
+                             "A human is needed: add `maintainer:paused` to the ledger issue and set the repository "
+                             "variable `PRODUCTION_DEPLOY_ENABLED=false` on omni-reviewbot, then investigate.",
+                             "",
+                             marker,
+                         ]), labels=[labels["blocked"]])
+
+
+def _after_terminal_label(gh: Gh, repo: str, incident: dict[str, Any], state: str) -> None:
+    """The one side effect that must come AFTER the terminal label: closing a
+    recovered incident. Closing first would hide it from the open-incident
+    scan before its state was persisted."""
+    number = int(incident["number"])
+    if state == rollback_mod.RECOVERED and _issue_is_open(gh, repo, number):
+        close_issue(gh, repo=repo, number=number, comment="production verified healthy after the rollback")
 
 
 def _rewrite_canary_body(gh: Gh, repo: str, number: int, record: canary_mod.CanaryRecord) -> None:
@@ -597,11 +772,17 @@ def cmd_release_revert(args: argparse.Namespace, policy: dict[str, Any], gh: Gh)
 def cmd_release_pin_check(args: argparse.Namespace, policy: dict[str, Any], gh: Gh) -> int:
     imc = next(s for s, c in policy["repos"].items() if c.get("alias") == "imc")
     rb = policy["ledger"]["repo"]
-    incidents = gh.api(f"repos/{rb}/issues?labels={policy['labels']['incident']},provider&state=open&per_page=100",
+    # Provider failures are filed as `maintainer:filed` + `provider` (in IMC
+    # by the monitor); incidents may also carry `provider`. Count both.
+    open_provider = 0
+    for slug, label in ((imc, policy["labels"]["filed"]), (rb, policy["labels"]["filed"]),
+                        (rb, policy["labels"]["incident"])):
+        found = gh.api(f"repos/{slug}/issues?labels={label},provider&state=open&per_page=100",
                        paginate=True) or []
+        open_provider += len([i for i in found if "pull_request" not in i])
     gaps = pin_bump_preconditions(gh, imc_repo=imc, candidate_sha=args.candidate,
                                   ci_check=repo_config(policy, imc).required_checks[0],
-                                  open_provider_incidents=len(incidents))
+                                  open_provider_incidents=open_provider)
     capabilities = json.loads(Path(args.capabilities).read_text()) if args.capabilities else {}
     if capabilities:
         gaps += handshake_check(capabilities, expected_direct=args.expected_direct, expected_strict=args.expected_strict,

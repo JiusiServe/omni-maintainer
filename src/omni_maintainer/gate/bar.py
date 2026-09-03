@@ -222,10 +222,17 @@ def evaluate(snapshot: PullSnapshot, *, policy: dict[str, Any], repo: RepoConfig
     elif snapshot.mergeable_state == "dirty":
         result.failures.append("merge conflicts (mergeable_state=dirty)")
 
-    # never-merge head branches
+    # Hard exclusions: never merged by automation, go label or not. The
+    # knowledge plane and adapter manifests are human-promoted by invariant.
     for pattern in policy["carve_outs"].get("never_merge_head_branches") or ():
         if fnmatchcase(snapshot.head_ref, pattern):
             result.failures.append(f"head branch {snapshot.head_ref!r} is never merged by automation")
+    excluded = sorted({path for path in snapshot.paths()
+                       for pattern in (policy["carve_outs"].get("never_merge_paths") or ())
+                       if path_matches(path, pattern)})
+    if excluded:
+        result.failures.append("paths that automation never merges (human promotion only): "
+                               + ", ".join(excluded[:6]) + (" …" if len(excluded) > 6 else ""))
 
     # 2. required CI on the head, bound to the integration that must produce it
     ci_app = str(policy["identities"].get("ci_app_slug") or "github-actions")
@@ -242,6 +249,19 @@ def evaluate(snapshot: PullSnapshot, *, policy: dict[str, Any], repo: RepoConfig
         state = _check_state(snapshot, name, ci_app)
         if state in ("failure", "pending"):
             result.failures.append(f"check {name!r} is {state} on {snapshot.head_sha[:8]}")
+    # Path-conditional checks: required exactly when the PR touches a path
+    # the check's workflow triggers on, decided from the changed paths, not
+    # from whether a run happens to exist. Absent, cancelled or pending is a
+    # failure then; a check that did not need to run is ignored.
+    for name, globs in repo.path_checks:
+        touched = sorted({p for p in snapshot.paths() if any(path_matches(p, g) for g in globs)})
+        if not touched:
+            continue
+        state = _check_state(snapshot, name, ci_app)
+        if state != "success":
+            result.failures.append(
+                f"check {name!r} is required by changed paths ({', '.join(touched[:3])}"
+                f"{' …' if len(touched) > 3 else ''}) and is {state} on {snapshot.head_sha[:8]}")
 
     # 3. reviewer verdict on the exact head
     if not fast_path:

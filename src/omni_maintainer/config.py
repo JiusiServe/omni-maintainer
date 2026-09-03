@@ -40,6 +40,8 @@ class RepoConfig:
     deploy_workflow: str
     deploy_workflow_name: str
     pin_file: str
+    # (check name, path globs): required exactly when a PR touches a matching path
+    path_checks: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
     @property
     def gate_may_merge(self) -> bool:
@@ -117,6 +119,11 @@ def repo_config(policy: dict[str, Any], slug: str) -> RepoConfig:
         deploy_workflow=str(cfg.get("deploy_workflow") or ""),
         deploy_workflow_name=str(cfg.get("deploy_workflow_name") or ""),
         pin_file=str(cfg.get("pin_file") or ""),
+        path_checks=tuple(
+            (str(item["name"]), tuple(str(g) for g in item.get("paths") or ()))
+            for item in (cfg.get("path_checks") or ())
+            if isinstance(item, dict) and item.get("name")
+        ),
     )
 
 
