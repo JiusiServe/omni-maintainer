@@ -1,0 +1,147 @@
+# Fragment for JiusiServe/omni-reviewbot .github/workflows/deploy.yml.
+#
+# Splice the `canary-record` job below between `build-and-test` and
+# `deploy-production`, then, in the SAME pull request (these must land
+# atomically with the pin-file change and its test updates):
+#   - add `canary-record` to `deploy-production.needs`
+#   - give deploy-production and canary-record the SAME predicate:
+#       github.event_name == 'push' && github.ref == 'refs/heads/main'
+#       && vars.PRODUCTION_DEPLOY_ENABLED == 'true'
+#     so a manual workflow_dispatch is build-only, a disabled deployment
+#     records no phantom canary, and every real deployment has a record
+#     written by its own run (no run-id lookup, no race).
+#
+# Permissions: the workflow-level block is `contents: read`; this job
+# declares its own `issues: write` (job-level permissions replace the
+# workflow-level set for that job) and uses the default GITHUB_TOKEN.
+#
+# Atomicity: the job runs under its own concurrency group with
+# cancel-in-progress false, so two pushes serialize here; the second run
+# waits, then sees the first run's open canary and fails. The existing
+# `reviewbot-production-deploy` group still serializes the deploy itself.
+#
+# It fails, and thereby blocks deploy-production, when:
+#   - another canary window, incident or rollback is still open
+#     (one active deployment through the full canary window), or
+#   - the record cannot be created.
+# Rollback exception: a push is admitted despite open items when it is the
+# merge of the revert PR named by an open incident's rollback marker AND the
+# merge's second parent equals that marker's expected revert sha.
+# Retry: once the open window closes, re-run the failed run from the Actions
+# UI ("Re-run failed jobs" keeps the push context), or push again.
+jobs:
+  canary-record:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.PRODUCTION_DEPLOY_ENABLED == 'true'
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    concurrency:
+      group: reviewbot-canary-record
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: read
+    steps:
+      - name: Refuse to deploy while a canary window, incident or rollback is open (rollback excepted)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MERGE_SHA: ${{ github.sha }}
+          HEAD_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, subprocess, sys
+          repo = os.environ["GITHUB_REPOSITORY"]
+          merge_sha = os.environ["MERGE_SHA"]
+          message = os.environ.get("HEAD_MESSAGE") or ""
+
+          def gh(*args):
+              return subprocess.run(["gh", *args], text=True, capture_output=True, check=True).stdout
+
+          def issues(label, state="open"):
+              pages = json.loads(gh("api", "--paginate", "--slurp",
+                                    f"repos/{repo}/issues?labels={label}&state={state}&per_page=100"))
+              return [i for page in pages for i in page if "pull_request" not in i]
+
+          # Is this push the merge of a revert PR that an open incident is waiting for?
+          rollback_ok = False
+          pr_match = re.match(r"^Merge pull request #(\d+)", message)
+          if pr_match:
+              pushed_pr = int(pr_match.group(1))
+              commit = json.loads(gh("api", f"repos/{repo}/commits/{merge_sha}"))
+              parents = [p["sha"] for p in commit.get("parents", [])]
+              for incident in issues("maintainer:incident"):
+                  texts = [incident.get("body") or ""]
+                  texts += [c.get("body") or "" for c in json.loads(gh(
+                      "api", "--paginate", f"repos/{repo}/issues/{incident['number']}/comments?per_page=100"))]
+                  for text in texts:
+                      m = re.search(r"<!--\s*omni-maintainer:rollback:v1\s+(\{.*?\})\s*-->", text, re.S)
+                      if not m:
+                          continue
+                      rec = json.loads(m.group(1))
+                      if int(rec.get("revert_pr") or 0) == pushed_pr and len(parents) == 2 \
+                              and parents[1] == rec.get("expected_revert_sha"):
+                          rollback_ok = True
+                          print(f"admitting rollback deploy: revert PR #{pushed_pr} for incident #{incident['number']}")
+          if rollback_ok:
+              sys.exit(0)
+
+          blocking = []
+          for label in ("maintainer:canary", "maintainer:incident", "maintainer:rollback"):
+              for issue in issues(label):
+                  if label == "maintainer:canary" and f'"merge_sha": "{merge_sha}"' in (issue.get("body") or ""):
+                      continue  # our own record from a re-run
+                  blocking.append(f"#{issue['number']} ({label}) {issue.get('title')}")
+          if blocking:
+              print("deployment blocked; resolve or wait for these to close, then re-run this workflow run:")
+              print("\n".join(blocking))
+              sys.exit(1)
+          print("no open canary, incident or rollback; proceeding")
+          PY
+
+      - name: Record the canary for this deploy (idempotent on merge_sha)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MERGE_SHA: ${{ github.sha }}
+          PRE_MERGE_SHA: ${{ github.event.before }}
+          RUN_ID: ${{ github.run_id }}
+          HEAD_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, subprocess, sys
+          from datetime import datetime, timezone
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          merge_sha = os.environ["MERGE_SHA"]
+          pre = os.environ.get("PRE_MERGE_SHA") or ""
+          run_id = int(os.environ["RUN_ID"])
+          message = os.environ.get("HEAD_MESSAGE") or ""
+          pr = re.match(r"^Merge pull request #(\d+)", message)
+          pr_number = int(pr.group(1)) if pr else None
+          label = "maintainer:canary"
+
+          def gh(*args, stdin=None):
+              return subprocess.run(["gh", *args], text=True, capture_output=True, check=True, input=stdin).stdout
+
+          existing = json.loads(gh("api", "--paginate", "--slurp",
+                                   f"repos/{repo}/issues?labels={label}&state=all&per_page=100"))
+          for page in existing:
+              for issue in page:
+                  if f'"merge_sha": "{merge_sha}"' in (issue.get("body") or ""):
+                      print(f"canary already recorded: #{issue['number']}")
+                      sys.exit(0)
+
+          record = {"repo": repo, "merge_sha": merge_sha, "pre_merge_sha": pre, "pr_number": pr_number,
+                    "deploy_run_id": run_id, "opened_at": datetime.now(timezone.utc).isoformat(),
+                    "kind": "rb", "status": "pending", "baseline": None}
+          body = "\n".join([
+              f"Deploy of `{merge_sha}` (previous `{pre}`), run {os.environ['GITHUB_SERVER_URL']}/{repo}/actions/runs/{run_id}",
+              f"PR: #{pr_number}" if pr_number else "PR: (direct push)",
+              "",
+              "The monitor appends one tick comment per hour and closes this issue when the window passes.",
+              "",
+              f"<!-- omni-maintainer:canary:v1 {json.dumps(record, sort_keys=True)} -->",
+          ])
+          payload = json.dumps({"title": f"[canary] deploy {merge_sha[:8]}", "body": body, "labels": [label]})
+          out = gh("api", f"repos/{repo}/issues", "-X", "POST", "--input", "-", stdin=payload)
+          print("canary recorded:", json.loads(out)["html_url"])
+          PY

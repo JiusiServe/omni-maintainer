@@ -1,0 +1,52 @@
+# maintainer-merge: the single merge arbiter for Tier A repositories.
+#
+# Lives ONLY in JiusiServe/omni-maintainer. One concurrency group serializes
+# every merge decision across repositories, and each candidate is
+# re-evaluated on a fresh snapshot immediately before `gh pr merge
+# --match-head-commit`, so the daily cap and every other rule are decided
+# atomically. Replace every <PIN-SHA> before merging this file.
+name: maintainer-merge
+
+on:
+  schedule:
+    - cron: "41 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: maintainer-merge
+  cancel-in-progress: false
+
+jobs:
+  arbiter:
+    runs-on: ubuntu-latest
+    environment: gate
+    timeout-minutes: 30
+    steps:
+      - name: Mint the gate App token
+        id: app
+        uses: actions/create-github-app-token@<PIN-SHA> # v2
+        with:
+          app-id: ${{ secrets.GATE_APP_ID }}
+          private-key: ${{ secrets.GATE_APP_PRIVATE_KEY }}
+          owner: JiusiServe
+          repositories: omni-reviewbot,InferMatrixCopilot,omni-maintainer
+
+      - uses: actions/setup-python@<PIN-SHA> # v6
+        with:
+          python-version: "3.12"
+
+      - name: Install the pinned evaluator
+        env:
+          OMNI_MAINTAINER_SHA: "<PIN-SHA>"
+        run: python -m pip install --quiet "git+https://github.com/JiusiServe/omni-maintainer@${OMNI_MAINTAINER_SHA}"
+
+      - name: Merge Tier A pull requests that pass a fresh, complete bar
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        # --workdir is a directory into which the arbiter clones each Tier A
+        # repository's bare objects (no checkout, nothing executed) so revert
+        # PRs can be verified against the recorded pre-merge commit.
+        run: python -m omni_maintainer gate arbiter --workdir work

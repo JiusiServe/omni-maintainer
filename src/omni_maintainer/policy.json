@@ -1,0 +1,137 @@
+{
+  "schema": 1,
+  "phase": {
+    "issues_live": false,
+    "merges_enabled": false,
+    "revert_mode": "report",
+    "rb_auto_revert_merge": false
+  },
+  "identities": {
+    "gate_app_slug": "omni-maintainer-gate",
+    "ci_app_slug": "github-actions",
+    "reviewer_login": "omni-maintainer-gate[bot]",
+    "gate_merger_logins": ["omni-maintainer-gate[bot]"],
+    "routine_login": "",
+    "tick_authors": [],
+    "humans": ["tzhouam"]
+  },
+  "repos": {
+    "JiusiServe/omni-reviewbot": {
+      "alias": "rb",
+      "tier": "B",
+      "deploys": true,
+      "required_checks": ["build-and-test"],
+      "optional_checks": [],
+      "deploy_workflow": "deploy.yml",
+      "deploy_workflow_name": "Test and deploy reviewbot",
+      "ci_workflow_name": "Test and deploy reviewbot",
+      "pin_file": "deploy/provider-release-sha"
+    },
+    "JiusiServe/InferMatrixCopilot": {
+      "alias": "imc",
+      "tier": "A",
+      "deploys": false,
+      "required_checks": ["suite"],
+      "optional_checks": ["audit"],
+      "ci_workflow_name": "tests"
+    },
+    "JiusiServe/omni-maintainer": {
+      "alias": "maint",
+      "tier": "A",
+      "deploys": false,
+      "human_only": true,
+      "required_checks": ["tests"],
+      "optional_checks": [],
+      "ci_workflow_name": "tests"
+    }
+  },
+  "ledger": {
+    "repo": "JiusiServe/omni-reviewbot",
+    "issue": 0,
+    "title": "Maintainer ledger"
+  },
+  "labels": {
+    "filed": "maintainer:filed",
+    "incident": "maintainer:incident",
+    "canary": "maintainer:canary",
+    "rollback": "maintainer:rollback",
+    "blocked": "maintainer:blocked",
+    "stale": "maintainer:stale",
+    "proposed": "maintainer:proposed",
+    "merge_requested": "maintainer:merge-requested",
+    "go": "maintainer-go",
+    "paused": "maintainer:paused"
+  },
+  "caps": {
+    "merges_per_day": 3,
+    "prs_per_day": 5
+  },
+  "bar": {
+    "veto_hours": 24,
+    "max_changed_lines": 600,
+    "max_commits": 20,
+    "max_files": 3000,
+    "hold_phrase": "maintainer: hold",
+    "collaborator_associations": ["OWNER", "MEMBER", "COLLABORATOR"]
+  },
+  "carve_outs": {
+    "all": [
+      ".github/workflows/**",
+      "deploy/**",
+      "scripts/*release*",
+      "scripts/provision-split.sh",
+      "adapters/*/manifest.yaml",
+      "knowledge/**",
+      ".env*",
+      "deploy/personal-agent/**"
+    ],
+    "JiusiServe/omni-reviewbot": [
+      "src/omni_reviewbot/process.py",
+      "src/omni_reviewbot/strict_backend.py",
+      "src/omni_reviewbot/strict_host.py",
+      "src/omni_reviewbot/config.py",
+      "src/omni_reviewbot/github_client.py"
+    ],
+    "JiusiServe/InferMatrixCopilot": [],
+    "JiusiServe/omni-maintainer": ["**"],
+    "exempt": {
+      "JiusiServe/omni-reviewbot": ["deploy/provider-release-sha"]
+    },
+    "pyproject_dependency_pattern": "^[+-]\\s*(dependencies|\"infermatrix-copilot)",
+    "never_merge_head_branches": ["knowledge/intake-*"]
+  },
+  "stale": {
+    "label_after_days": 14,
+    "close_after_days": 30
+  },
+  "dashboards": {
+    "vllm_omni": "http://review.43.155.186.30.nip.io/code_review/vllm_omni",
+    "vllm_gr": "http://review.43.155.186.30.nip.io/code_review/vllm_gr"
+  },
+  "monitor": {
+    "http_timeout_seconds": 90,
+    "http_attempts": 3,
+    "http_retry_seconds": 30,
+    "slow_seconds": 60,
+    "watcher_dead_multiplier": 3,
+    "maintenance_unexpected_ticks": 2,
+    "error_excerpt_chars": 400,
+    "fingerprint_quiet_days": 7
+  },
+  "canary": {
+    "start_grace_minutes": 15,
+    "min_ticks": 3,
+    "min_new_jobs": 5,
+    "max_hours": 24,
+    "down_ticks_to_trip": 2,
+    "failed_jobs_floor": 2,
+    "failed_jobs_multiplier": 3.0,
+    "gate_failures_delta": 2,
+    "outcome_failed_delta": 2,
+    "split_failed_delta": 2,
+    "scan_regressions_to_trip": 2,
+    "deploy_waiting_hold_hours": 2,
+    "rollback_verify_ticks": 2,
+    "rollback_verify_max_hours": 3
+  }
+}
