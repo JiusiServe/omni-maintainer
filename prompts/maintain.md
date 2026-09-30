@@ -83,5 +83,10 @@ whole contract; you start with no other context.
    open, open one on a branch `maintainer/pin-<sha8>` changing only that file,
    using the printed body, labeled `maintainer:merge-requested`.
 5. `python -m omni_maintainer ledger --apply`.
+5b. When the improvement engine's outbox is mounted (`IMPROVE_OUTBOX_DIR`
+   set): `python -m omni_maintainer propose --outbox "$IMPROVE_OUTBOX_DIR"`.
+   It opens, relabels and closes the engine's proposal issues and writes
+   acks and observations back; never edit those issues by hand and never
+   write into that directory yourself.
 6. Finish by printing a JSON summary: PRs opened, comments posted, proposals,
    anything blocked, and what awaits a human.

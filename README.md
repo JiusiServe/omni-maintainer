@@ -67,6 +67,7 @@ python -m omni_maintainer monitor tick [--apply]    # dashboards, failures, push
 python -m omni_maintainer monitor ack --instance I --updated-at T | --rb-main-sha S   # advance a cursor after its issue exists
 python -m omni_maintainer issue upsert --repo R --fingerprint FP --title T --body-file F [--ack-instance I --ack-updated-at T]
 python -m omni_maintainer work-queue
+python -m omni_maintainer propose --outbox DIR [--repo R]   # the improvement engine's proposal issues
 python -m omni_maintainer stale-prs --repo R [--apply]
 python -m omni_maintainer ledger [--apply]
 python -m omni_maintainer release revert --repo R --workdir D --merge-sha S --pre-merge-sha P --incident-url U --reason T
