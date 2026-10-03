@@ -2,6 +2,7 @@
   "schema": 1,
   "phase": {
     "issues_live": false,
+    "evolution_prs_live": false,
     "merges_enabled": false,
     "revert_mode": "report",
     "rb_auto_revert_merge": false

@@ -311,6 +311,12 @@ def evaluate(snapshot: PullSnapshot, *, policy: dict[str, Any], repo: RepoConfig
                 f"paths that only a human may merge need label {label_names['go']} from a human: {listed}")
 
     # 6b. carve-outs
+    if snapshot.head_ref.startswith("evolve/") or "<!-- evolve:candidate:" in snapshot.body:
+        result.requires_go = True
+        if enforce_caps:
+            result.failures.append("evolution candidates require human promotion; automation never merges them")
+        elif not has_go:
+            result.failures.append(f"evolution candidate needs verified human label {label_names['go']}")
     hits = carve_out_hits(snapshot, policy)
     result.carve_out_paths = hits
     if repo.human_only:

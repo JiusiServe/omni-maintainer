@@ -107,3 +107,18 @@ python -m pytest -q
 
 Runtime is standard-library only. Every change to this repository is
 human-merged by design (the arbiter needs a human `maintainer-go` here).
+
+### Human-reviewed workflow evolution
+
+`omni-maintainer evolve --outbox /srv/copilot/evolution-outbox --source /srv/repos/InferMatrixCopilot`
+consumes the separate `evolve-outbox/1` protocol. It checks promotion evidence, test status,
+patch/report digests and the exact applied source tree against a trusted local baseline.
+The target base must still match the evaluated baseline. It never executes candidate code.
+
+`phase.evolution_prs_live` defaults to `false`; dry runs validate artifacts without pushing.
+When the repository policy enables publication and `MAINT_DRY_RUN` is unset, the command
+pushes `evolve/<candidate>` and creates a draft PR. A retry reuses an already pushed matching
+branch or an existing marked PR. A changed branch or stale base requires re-evaluation.
+The regular arbiter cannot autonomously promote these PRs: a verified human go is required.
+Merge observations are written to `inbox/`; Copilot independently waits for production
+source/config fingerprints before updating its deployment baseline.

@@ -933,6 +933,13 @@ def cmd_propose(args: argparse.Namespace, policy: dict[str, Any], gh: Gh) -> int
     return EXIT_OK
 
 
+def cmd_evolve(args: argparse.Namespace, policy: dict[str, Any], gh: Gh) -> int:
+    from .routine import evolve
+    report = evolve.run(gh, policy, outbox=Path(args.outbox), source=Path(args.source))
+    _emit(report)
+    return EXIT_FAIL if report["failed"] else EXIT_OK
+
+
 # ---------------------------------------------------------------- routine helpers
 
 def cmd_work_queue(args: argparse.Namespace, policy: dict[str, Any], gh: Gh) -> int:
@@ -1109,6 +1116,10 @@ def build_parser() -> argparse.ArgumentParser:
     pp.add_argument("--outbox", required=True, help="the engine's outbox directory (improve-outbox/1)")
     pp.add_argument("--repo", default="", help="override the repository every action targets")
     pp.set_defaults(func=cmd_propose)
+    ep = sub.add_parser("evolve", help="publish and observe human-promoted evolution draft PRs (evolve-outbox/1)")
+    ep.add_argument("--outbox", required=True)
+    ep.add_argument("--source", required=True, help="trusted local clone containing the pinned source baseline")
+    ep.set_defaults(func=cmd_evolve)
     st = sub.add_parser("stale-prs", help="label/close idle PRs")
     st.add_argument("--repo", required=True)
     st.add_argument("--apply", action="store_true")
