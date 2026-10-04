@@ -914,6 +914,32 @@ def cmd_issue_upsert(args: argparse.Namespace, policy: dict[str, Any], gh: Gh) -
     return EXIT_OK
 
 
+def cmd_propose(args: argparse.Namespace, policy: dict[str, Any], gh: Gh) -> int:
+    """The meta-improvement engine's publication channel: apply its outbox
+    actions (open/update/close proposal issues) and write back acks and
+    observations. Shadow until ``phase.issues_live``."""
+    from .routine import propose
+
+    phase_note = _enforce_issues_phase(policy, what="propose")
+    try:
+        report = propose.run(gh, policy, outbox=Path(args.outbox), repo=args.repo or "")
+    except propose.ProposeError as exc:
+        _emit({"ok": False, "error": str(exc)})
+        return EXIT_FAIL
+    report["ok"] = True
+    if phase_note:
+        report["note"] = phase_note
+    _emit(report)
+    return EXIT_OK
+
+
+def cmd_evolve(args: argparse.Namespace, policy: dict[str, Any], gh: Gh) -> int:
+    from .routine import evolve
+    report = evolve.run(gh, policy, outbox=Path(args.outbox), source=Path(args.source))
+    _emit(report)
+    return EXIT_FAIL if report["failed"] else EXIT_OK
+
+
 # ---------------------------------------------------------------- routine helpers
 
 def cmd_work_queue(args: argparse.Namespace, policy: dict[str, Any], gh: Gh) -> int:
@@ -1086,6 +1112,14 @@ def build_parser() -> argparse.ArgumentParser:
     up.set_defaults(func=cmd_issue_upsert)
 
     sub.add_parser("work-queue", help="ordered work items for the daily routine").set_defaults(func=cmd_work_queue)
+    pp = sub.add_parser("propose", help="apply the meta-improvement engine's outbox (proposal issues) and observe them")
+    pp.add_argument("--outbox", required=True, help="the engine's outbox directory (improve-outbox/1)")
+    pp.add_argument("--repo", default="", help="override the repository every action targets")
+    pp.set_defaults(func=cmd_propose)
+    ep = sub.add_parser("evolve", help="publish and observe human-promoted evolution draft PRs (evolve-outbox/1)")
+    ep.add_argument("--outbox", required=True)
+    ep.add_argument("--source", required=True, help="trusted local clone containing the pinned source baseline")
+    ep.set_defaults(func=cmd_evolve)
     st = sub.add_parser("stale-prs", help="label/close idle PRs")
     st.add_argument("--repo", required=True)
     st.add_argument("--apply", action="store_true")
