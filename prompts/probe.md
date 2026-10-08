@@ -30,9 +30,12 @@ Record the start time, then run each check and keep its result:
    `gh variable list -R JiusiServe/omni-reviewbot` (note: allowed or denied),
    `gh api repos/JiusiServe/omni-reviewbot/environments/production`
    (note approval rules or the error).
-3. Dashboards: time `curl --max-time 90` of
-   `http://review.43.155.186.30.nip.io/code_review/vllm_omni/api/status` and
-   `.../vllm_gr/api/status`; record HTTP status, seconds, payload size.
+3. Dashboards: time `python -m omni_maintainer monitor read --instance vllm_omni
+   --credentials-file /home/ubuntu/project/.omni-reviewbot/shared/dashboard-auth/service.env`
+   and the same command with `vllm_gr`; record success,
+   seconds, and payload size. Credentials use the normal HTTPS login and an
+   in-memory cookie session. Only the helper reads the file as data; never
+   inspect, print, or shell-source it, put passwords in arguments, or save cookies.
 4. Writes (all reversible): create an issue in `JiusiServe/omni-maintainer`
    titled `[probe] capability check <UTC timestamp>`, add and remove a label
    on it, comment once, then close it. Note any step that was denied.

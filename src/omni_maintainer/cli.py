@@ -29,6 +29,7 @@ from .monitor import rollback as rollback_mod
 from .gate.reads import parse_time
 from .monitor.dashboard import (Digest, digest, fetch_json, job_time, job_url, new_failed_jobs, status_url,
                                 watcher_dead, window_saturated)
+from .monitor.dashboard_auth import DashboardAuthError, DashboardClient
 from .monitor.fingerprint import classify, excerpt, fingerprint
 from .monitor.issues import (UnsafeText, add_labels, close_issue, comment_issue, create_issue,
                              ensure_safe, find_issue_by_marker, fingerprint_marker, remove_labels,
@@ -335,14 +336,41 @@ def cmd_arbiter(args: argparse.Namespace, policy: dict[str, Any], gh: Gh) -> int
 
 # ---------------------------------------------------------------- monitor
 
-def _fetch_digests(policy: dict[str, Any], now: datetime) -> dict[str, Digest]:
+def _fetch_digests(policy: dict[str, Any], now: datetime, *, client: DashboardClient | None = None) -> dict[str, Digest]:
     m = policy["monitor"]
     out: dict[str, Digest] = {}
+    client = client or DashboardClient(policy["dashboards"].values())
     for name, base in policy["dashboards"].items():
         fetched = fetch_json(status_url(base), timeout=float(m["http_timeout_seconds"]),
-                             attempts=int(m["http_attempts"]), retry_seconds=float(m["http_retry_seconds"]))
+                             attempts=int(m["http_attempts"]), retry_seconds=float(m["http_retry_seconds"]),
+                             opener=client)
         out[name] = digest(name, fetched, now=now)
     return out
+
+
+def cmd_monitor_read(args: argparse.Namespace, policy: dict[str, Any], gh: Gh) -> int:
+    """Read private status or job detail without putting credentials in argv."""
+    base = policy["dashboards"].get(args.instance)
+    if base is None:
+        _emit({"ok": False, "error": "unknown dashboard instance"})
+        return EXIT_USAGE
+    if args.job is not None and args.job < 1:
+        _emit({"ok": False, "error": "job must be a positive integer"})
+        return EXIT_USAGE
+    m = policy["monitor"]
+    client = (DashboardClient.from_credentials_file(policy["dashboards"].values(), args.credentials_file)
+              if args.credentials_file else DashboardClient(policy["dashboards"].values()))
+    fetched = fetch_json(
+        job_url(base, args.job) if args.job is not None else status_url(base),
+        timeout=float(m["http_timeout_seconds"]), attempts=int(m["http_attempts"]),
+        retry_seconds=float(m["http_retry_seconds"]),
+        opener=client,
+    )
+    if not fetched.ok:
+        _emit({"ok": False, "error": fetched.error})
+        return EXIT_FAIL
+    _emit(fetched.payload)
+    return EXIT_OK
 
 
 def _deploy_run(gh: Gh, repo: str, run_id: int | None) -> tuple[str, str | None]:
@@ -462,7 +490,11 @@ def cmd_monitor_tick(args: argparse.Namespace, policy: dict[str, Any], gh: Gh) -
     m = policy["monitor"]
     phase_note = _enforce_issues_phase(policy, what="monitor tick --apply") if args.apply else ""
     cursors, ledger_body = _read_cursors(gh, policy, args.state_file)
-    digests = _fetch_digests(policy, now)
+    if args.credentials_file:
+        client = DashboardClient.from_credentials_file(policy["dashboards"].values(), args.credentials_file)
+        digests = _fetch_digests(policy, now, client=client)
+    else:
+        digests = _fetch_digests(policy, now)
     decisions: dict[str, Any] = {"at": now.isoformat(), "instances": {}, "failures": [], "canaries": [],
                                  "rollbacks": [], "pushes": [], "signals": [], "pending_acks": [], "notes": []}
     if phase_note:
@@ -1086,10 +1118,16 @@ def build_parser() -> argparse.ArgumentParser:
     ar.set_defaults(func=cmd_arbiter)
 
     mon = sub.add_parser("monitor", help="monitor routine commands").add_subparsers(dest="monitor_command", required=True)
+    read = mon.add_parser("read", help="read private dashboard status or job detail using the service account")
+    read.add_argument("--instance", required=True)
+    read.add_argument("--job", type=int, help="read this job's detail instead of status")
+    read.add_argument("--credentials-file", type=Path, help="owner-only service credential file (otherwise use environment)")
+    read.set_defaults(func=cmd_monitor_read)
     tick = mon.add_parser("tick", help="read dashboards, classify failures and pushes, evaluate canaries")
     tick.add_argument("--state-file", default=None,
                       help="local cursor file (tests/dry runs); default reads and writes the ledger issue marker")
     tick.add_argument("--apply", action="store_true", help="post canary ticks and transitions, persist cursors")
+    tick.add_argument("--credentials-file", type=Path, help="owner-only service credential file (otherwise use environment)")
     tick.set_defaults(func=cmd_monitor_tick)
     ack = mon.add_parser("ack", help="advance a cursor after its issue exists")
     ack.add_argument("--instance")
@@ -1163,6 +1201,9 @@ def main(argv: list[str] | None = None) -> int:
         return int(args.func(args, policy, gh))
     except GhError as exc:
         # An unhandled GitHub failure means no decision was made or recorded.
+        _emit({"ok": False, "error": str(exc)})
+        return EXIT_CRASH
+    except DashboardAuthError as exc:
         _emit({"ok": False, "error": str(exc)})
         return EXIT_CRASH
 

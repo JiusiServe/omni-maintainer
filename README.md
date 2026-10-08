@@ -50,7 +50,7 @@ the reverted merge.
 
 Every push to omni-reviewbot `main` is a deploy. The deploy run itself records
 a canary issue; the monitor ticks it hourly against a 14-day baseline of the
-public dashboards and closes it, or trips it. A trip opens an incident whose
+private dashboards and closes it, or trips it. A trip opens an incident whose
 labels walk a rollback state machine: a revert PR is prepared (human-merged on
 omni-reviewbot), its deploy is watched, and production must verify healthy on
 two consecutive ticks before the incident closes.
@@ -63,7 +63,8 @@ python -m omni_maintainer gate evaluate --repo R --pr N [--publish]
 python -m omni_maintainer gate review-queue --repo R
 python -m omni_maintainer gate post-verdict --repo R --pr N --head SHA --verdict APPROVE|REVISE --body-file F
 python -m omni_maintainer gate arbiter              # Tier A merges under one concurrency group
-python -m omni_maintainer monitor tick [--apply]    # dashboards, failures, pushes, canaries
+python -m omni_maintainer monitor tick [--apply] [--credentials-file F] # dashboards, failures, pushes, canaries
+python -m omni_maintainer monitor read --instance I [--job N] [--credentials-file F] # authenticated reads
 python -m omni_maintainer monitor ack --instance I --updated-at T | --rb-main-sha S   # advance a cursor after its issue exists
 python -m omni_maintainer issue upsert --repo R --fingerprint FP --title T --body-file F [--ack-instance I --ack-updated-at T]
 python -m omni_maintainer work-queue
@@ -97,6 +98,36 @@ src/omni_maintainer/monitor dashboard, fingerprint, canary, rollback, pushes, is
 src/omni_maintainer/routine preflight, workqueue, release, ledger, ghcli
 tests/                      fixtures are real dashboard snapshots and public PR captures
 ```
+
+## Dashboard service account
+
+The ReviewBot owner provisions a service account through its local auth CLI.
+Both bot dashboards share that account and its normal cookie sessions. Set
+`REVIEWBOT_DASHBOARD_USERNAME` and `REVIEWBOT_DASHBOARD_PASSWORD` in the monitor
+environment; configure the same two GitHub Actions secrets for both canary
+workflow steps. The dashboard URLs in policy use HTTPS.
+
+On the production host, keep the environment assignments in
+`/home/ubuntu/project/.omni-reviewbot/shared/dashboard-auth/service.env`, owned by the
+service user with mode `600` in its mode `700` auth directory. Pass its path
+to the helper, which reads assignments as data without executing shell code:
+
+```sh
+credentials_file=/home/ubuntu/project/.omni-reviewbot/shared/dashboard-auth/service.env
+python -m omni_maintainer monitor tick --credentials-file "$credentials_file"
+python -m omni_maintainer monitor read --instance vllm_omni --credentials-file "$credentials_file"
+python -m omni_maintainer monitor read --instance vllm_gr --job 123 --credentials-file "$credentials_file"
+```
+
+Do not inspect, print, or shell-source the credential file, or pass passwords
+on the command line. The client keeps cookies only in
+memory, sends the exact HTTPS Origin on login, and shares the `/code_review/`
+cookie across both instances. A protected GET returning `401` triggers one
+login and one retry; failed login never falls back to anonymous access. During
+the first deployment, the older app can still answer the initial GET before
+the protected server is promoted. No legacy bearer token is sent or accepted
+by this client. HTTP URLs and redirects are rejected before credentials can
+be submitted.
 
 ## Development
 

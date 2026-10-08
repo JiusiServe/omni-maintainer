@@ -123,8 +123,8 @@
     "close_after_days": 30
   },
   "dashboards": {
-    "vllm_omni": "http://review.43.155.186.30.nip.io/code_review/vllm_omni",
-    "vllm_gr": "http://review.43.155.186.30.nip.io/code_review/vllm_gr"
+    "vllm_omni": "https://review.43.155.186.30.nip.io/code_review/vllm_omni",
+    "vllm_gr": "https://review.43.155.186.30.nip.io/code_review/vllm_gr"
   },
   "monitor": {
     "http_timeout_seconds": 90,
