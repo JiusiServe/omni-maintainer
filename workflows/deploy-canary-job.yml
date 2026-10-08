@@ -61,6 +61,8 @@ jobs:
       - name: Record the canary for this deploy attempt
         env:
           GH_TOKEN: ${{ github.token }}
+          REVIEWBOT_DASHBOARD_USERNAME: ${{ secrets.REVIEWBOT_DASHBOARD_USERNAME }}
+          REVIEWBOT_DASHBOARD_PASSWORD: ${{ secrets.REVIEWBOT_DASHBOARD_PASSWORD }}
           GITHUB_EVENT_BEFORE: ${{ github.event.before }}
           GITHUB_HEAD_MESSAGE: ${{ github.event.head_commit.message }}
           LEDGER_REPO: JiusiServe/omni-reviewbot
@@ -83,6 +85,8 @@ jobs:
   #     - name: deploy-guard (everything live, seconds before deploying)
   #       env:
   #         GH_TOKEN: ${{ github.token }}
+  #         REVIEWBOT_DASHBOARD_USERNAME: ${{ secrets.REVIEWBOT_DASHBOARD_USERNAME }}
+  #         REVIEWBOT_DASHBOARD_PASSWORD: ${{ secrets.REVIEWBOT_DASHBOARD_PASSWORD }}
   #         GITHUB_EVENT_BEFORE: ${{ github.event.before }}
   #         GITHUB_HEAD_MESSAGE: ${{ github.event.head_commit.message }}
   #         LEDGER_REPO: JiusiServe/omni-reviewbot

@@ -27,22 +27,32 @@ contract; you start with no other context.
   "Maintainer ledger" (number in `src/omni_maintainer/policy.json` → `ledger.issue`).
 - Provider: `JiusiServe/InferMatrixCopilot` (public).
 - Tooling: `JiusiServe/omni-maintainer` (this repository).
-- Dashboards (GET only, unauthenticated, the vllm-omni one takes ~12 s):
-  `http://review.43.155.186.30.nip.io/code_review/vllm_omni/api/status`,
-  `http://review.43.155.186.30.nip.io/code_review/vllm_gr/api/status`,
-  per-job detail at `/code_review/<instance>/api/jobs/<id>`.
+- Dashboards require the service account's normal cookie session over HTTPS.
+  Pass `--credentials-file /home/ubuntu/project/.omni-reviewbot/shared/dashboard-auth/service.env`
+  to the monitor helpers below; only the helper reads the protected file as
+  data. Never inspect, print, or shell-source it, put credential values in
+  command arguments, or persist session cookies. If the host already injects
+  `REVIEWBOT_DASHBOARD_USERNAME` and `REVIEWBOT_DASHBOARD_PASSWORD` into the
+  process environment, omit `--credentials-file`.
+  Use `python -m omni_maintainer monitor read --instance vllm_omni` (or
+  `vllm_gr`) for status and add `--job <id>` for job detail. The client sends
+  credentials only to the configured HTTPS login endpoint after HTTP 401;
+  authentication errors stop the read.
 
 ## Procedure
 
 1. `cd omni-maintainer && python -m pip install -q -e .`
 2. `python -m omni_maintainer preflight` — exit code 3 means a human paused
    the system: stop immediately, post nothing.
-3. `python -m omni_maintainer monitor tick --apply > tick.json` — this reads
+3. `python -m omni_maintainer monitor tick --apply --credentials-file
+   /home/ubuntu/project/.omni-reviewbot/shared/dashboard-auth/service.env > tick.json` — this reads
    both dashboards and CI, classifies new failed jobs and new commits on
    `main`, evaluates every open canary (posting its tick comment and any
    transition), and persists cursors. Read `tick.json`.
 4. For each entry in `failures` (one per new failed job):
-   - open its `detail_url`, read the step list and error, and write a short
+   - run `python -m omni_maintainer monitor read --instance <instance> --job <job_id>
+     --credentials-file /home/ubuntu/project/.omni-reviewbot/shared/dashboard-auth/service.env`,
+     read the step list and error, and write a short
      diagnosis: which step failed, the most likely cause, which module of
      omni-reviewbot or InferMatrixCopilot is implicated, and what a fix
      would need. Cite job ids and paths; do not guess beyond the evidence.

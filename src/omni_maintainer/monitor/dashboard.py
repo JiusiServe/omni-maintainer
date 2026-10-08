@@ -11,20 +11,21 @@ from __future__ import annotations
 import json
 import time
 import urllib.error
-import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 from ..gate.reads import parse_time
+from .dashboard_auth import DashboardAuthError, DashboardClient
 
 Opener = Callable[[str, float], tuple[int, bytes]]
 
 
 def _default_opener(url: str, timeout: float) -> tuple[int, bytes]:
-    request = urllib.request.Request(url, headers={"User-Agent": "omni-maintainer/0.1"})
-    with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 - fixed http URLs from policy
-        return int(response.status), response.read()
+    base, separator, _ = url.partition("/api/")
+    if not separator:
+        raise DashboardAuthError("dashboard request is outside the configured API paths")
+    return DashboardClient((base,))(url, timeout)
 
 
 @dataclass(frozen=True)
@@ -37,26 +38,33 @@ class Fetch:
 
 
 def fetch_json(url: str, *, timeout: float, attempts: int, retry_seconds: float,
-               opener: Opener = _default_opener, sleep: Callable[[float], None] = time.sleep) -> Fetch:
+               opener: Opener | None = None, sleep: Callable[[float], None] = time.sleep) -> Fetch:
     """GET ``url`` up to ``attempts`` times; a non-JSON body counts as a failure."""
     last_error = ""
     started = time.monotonic()
+    opener = opener or _default_opener
+    attempt = 0
     for attempt in range(1, attempts + 1):
         try:
             status, body = opener(url, timeout)
             if status != 200:
                 last_error = f"HTTP {status}"
+                if 400 <= status < 500:
+                    break
             else:
                 payload = json.loads(body.decode("utf-8", errors="replace"))
                 if not isinstance(payload, dict):
                     last_error = "payload is not a JSON object"
                 else:
                     return Fetch(True, time.monotonic() - started, payload, attempts=attempt)
+        except DashboardAuthError as exc:
+            last_error = str(exc)
+            break
         except (urllib.error.URLError, OSError, ValueError) as exc:
-            last_error = f"{type(exc).__name__}: {exc}"
+            last_error = f"{type(exc).__name__}: dashboard request failed"
         if attempt < attempts:
             sleep(retry_seconds)
-    return Fetch(False, time.monotonic() - started, None, last_error, attempts=attempts)
+    return Fetch(False, time.monotonic() - started, None, last_error, attempts=attempt)
 
 
 def status_url(base: str) -> str:
